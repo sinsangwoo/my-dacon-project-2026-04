@@ -1,5 +1,7 @@
 pandas
 numpy
 lightgbm
+catboost
 scikit-learn
+scipy
 pyyaml

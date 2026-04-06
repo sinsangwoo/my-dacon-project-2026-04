@@ -71,7 +71,7 @@ run_phase() {
     local done_marker="$DONE_DIR/$phase.done"
     local phase_log="$LOG_DIR/$phase.log"
     local attempt=1
-    local delays=(0 10 30)
+    local delays=(0 10 30 0) # Added 0 for 3rd attempt log safety
 
     if [ -f "$done_marker" ]; then
         echo "[SKIP] Phase $phase already completed." | tee -a "$PIPELINE_LOG"

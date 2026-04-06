@@ -3,6 +3,9 @@ import os
 class Config:
     # Execution Mode
     MODE = 'full' # 'full' or 'debug'
+    DEBUG_PHASE3 = False # For Phase 3 logic testing
+    DEBUG_MINIMAL = False # Full pipeline sanity check (< 10s)
+    DEBUG_MINIMAL_ROWS = 100
     
     # Paths
     DATA_PATH = './data/'
@@ -13,7 +16,7 @@ class Config:
     TARGET = 'avg_delay_minutes_next_30m'
     ID_COLS = ['ID', 'layout_id', 'scenario_id']
     
-    # Feature Engineering
+    # Feature Engineering (Full Set)
     TS_TOP_K = 30           # Number of features for basic TS
     INT_TOP_K = 20          # Number of features for interaction pair candidates
     INT_PRUNE_K = 50        # Number of interactions to keep after pruning
@@ -21,12 +24,19 @@ class Config:
     VARIANCE_THRESHOLD = 1e-6
     VELOCITY_CLIP_PERCENTILE = (1, 99)
     
+    # Feature Pruning (95% Importance)
+    IMPORTANCE_THRESHOLD = 0.95
+    
     # Validation & Stability
-    SPLIT_STRATEGY = 'GroupKFold' # 'GroupKFold' or 'KFold'
-    NFOLDS = 5 if MODE == 'full' else 2
+    SPLIT_STRATEGY = 'GroupKFold' 
+    ADAPTIVE_FOLDS = {'full': 5, 'debug': 2}
+    NFOLDS = ADAPTIVE_FOLDS[MODE]
     SEEDS = [42, 43, 44] if MODE == 'full' else [42]
     STABILITY_VAR_THRESHOLD = 0.5
     OVERFITTING_GAP_THRESHOLD = 0.2
+    
+    # Memory Guard (in MB)
+    MEMORY_WARN_THRESHOLD_MB = 6500
     
     # Stacking
     META_MODEL = 'ridge' # 'ridge' or 'lgbm'
@@ -39,8 +49,8 @@ class Config:
     LGBM_PARAMS = {
         'n_estimators': 2000,
         'learning_rate': 0.03,
-        'max_depth': 8,
-        'num_leaves': 127,
+        'max_depth': 7,        # Reduced from 8 for memory
+        'num_leaves': 80,      # Reduced from 127 for memory
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'reg_alpha': 0.5,
@@ -54,7 +64,7 @@ class Config:
     CAT_PARAMS = {
         'n_estimators': 2000,
         'learning_rate': 0.03,
-        'max_depth': 8,
+        'max_depth': 7,       # Reduced from 8 for memory
         'random_state': 42,
         'verbose': False,
         'early_stopping_rounds': 100,

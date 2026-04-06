@@ -1,3 +1,6 @@
 *.ipynb
 *.csv
-
+data/
+logs/
+outputs/
+.done/

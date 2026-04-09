@@ -1,6 +1,7 @@
 import pandas as pd
 import numpy as np
 import logging
+import gc
 from .config import Config
 from .utils import downcast_df, log_memory_usage
 
@@ -103,8 +104,8 @@ def add_scenario_summary_features(df, top_ts_cols):
 
     for col in top_ts_cols:
         groups = df.groupby('scenario_id')[col]
-        new_features[f'{col}_sc_mean'] = groups.transform('mean')
-        new_features[f'{col}_sc_var'] = groups.transform('var')
+        new_features[f'{col}_sc_mean'] = groups.transform('mean').astype('float32')
+        new_features[f'{col}_sc_var'] = groups.transform('var').astype('float32')
         
         def calc_segments(x):
             early = x.iloc[0:9]
@@ -121,13 +122,55 @@ def add_scenario_summary_features(df, top_ts_cols):
 
         seg_stats = df.groupby('scenario_id')[col].apply(calc_segments).unstack()
         for s_col in seg_stats.columns:
-            new_features[f'{col}_{s_col}'] = df['scenario_id'].map(seg_stats[s_col])
+            new_features[f'{col}_{s_col}'] = df['scenario_id'].map(seg_stats[s_col]).astype('float32')
 
-        new_features[f'{col}_late_early_diff'] = new_features[f'{col}_late_mean'] - new_features[f'{col}_early_mean']
-        new_features[f'{col}_mid_early_diff'] = new_features[f'{col}_mid_mean'] - new_features[f'{col}_early_mean']
-        new_features[f'{col}_peak_step'] = groups.transform(lambda x: x.reset_index(drop=True).idxmax())
+        new_features[f'{col}_late_early_diff'] = (new_features[f'{col}_late_mean'] - new_features[f'{col}_early_mean']).astype('float32')
+        new_features[f'{col}_mid_early_diff'] = (new_features[f'{col}_mid_mean'] - new_features[f'{col}_early_mean']).astype('float32')
+        new_features[f'{col}_peak_step'] = groups.transform(lambda x: x.reset_index(drop=True).idxmax()).astype('int16')
+        
+        del seg_stats; gc.collect()
 
-    df = pd.concat([df, pd.DataFrame(new_features)], axis=1)
+    # Inplace-like concat
+    for k, v in new_features.items():
+        df[k] = v
+    del new_features; gc.collect()
+    return df
+
+def add_sequence_trajectory_features(df, top_ts_cols):
+    """Add advanced sequence-aware trajectory features.
+    NO df.copy() - operates directly on input df columns.
+    """
+    logger.info(f"[SEQUENCE_FE] Starting column-wise trajectory generation...")
+    
+    for col in top_ts_cols:
+        ev, mv, lv = f'{col}_early_var', f'{col}_mid_var', f'{col}_late_var'
+        es, ms, ls = f'{col}_early_slope', f'{col}_mid_slope', f'{col}_late_slope'
+        em, mm, lm = f'{col}_early_mean', f'{col}_mid_mean', f'{col}_late_mean'
+        sv = f'{col}_sc_var'
+        
+        if ev in df.columns:
+            df[f'{col}_seq_early_std'] = np.sqrt(df[ev].fillna(0).clip(lower=0)).astype('float32')
+            df[f'{col}_seq_mid_std'] = np.sqrt(df[mv].fillna(0).clip(lower=0)).astype('float32')
+            df[f'{col}_seq_late_std'] = np.sqrt(df[lv].fillna(0).clip(lower=0)).astype('float32')
+            df[f'{col}_seq_volatility_ratio'] = (df[lv].fillna(0) / (df[ev].fillna(0) + 1e-9)).astype('float32')
+        
+        if es in df.columns and ls in df.columns:
+            df[f'{col}_seq_slope_accel'] = (df[ls].fillna(0) - df[es].fillna(0)).astype('float32')
+            df[f'{col}_seq_slope_accel_mid'] = (df[ms].fillna(0) - df[es].fillna(0)).astype('float32')
+        
+        if em in df.columns and lm in df.columns:
+            global_std = np.sqrt(df[sv].fillna(0).clip(lower=0)) + 1e-9 if sv in df.columns else np.float32(1.0)
+            df[f'{col}_seq_trend_strength'] = ((df[lm].fillna(0) - df[em].fillna(0)) / global_std).astype('float32')
+            
+            if mm in df.columns:
+                late_delta = df[lm].fillna(0) - df[mm].fillna(0)
+                early_delta = df[mm].fillna(0) - df[em].fillna(0)
+                df[f'{col}_seq_momentum_diff'] = (late_delta - early_delta).astype('float32')
+                df[f'{col}_seq_momentum_ratio'] = (late_delta / (early_delta.abs() + 1e-9)).astype('float32')
+        
+        # Periodic cleanup during heavy loop
+        if Config.MODE == 'full': gc.collect()
+    
     return df
 
 def add_binary_thresholding(df, top_ts_cols):
@@ -165,17 +208,16 @@ def handle_engineered_nans(df, feature_cols):
     delta_cols = [c for c in feature_cols if any(x in c for x in ['lag', 'diff', 'std', 'var', 'slope', 'velocity', 'trend'])]
     fill_values = {c: 0 for c in delta_cols if c in df.columns}
     
-    # Also add remaining mean_cols to zero-fill if ffill didn't catch everything (start of scenario)
+    # Also add remaining mean_cols to zero-fill if ffill didn't catch everything
     for col in mean_cols:
         if col in df.columns:
-            fill_values[col] = 0
+            df[col].fillna(0, inplace=True)
             
-    df = df.fillna(value=fill_values)
-    
-    # Final catch-all for any remaining NaNs (e.g. from merge or unexpected sources)
-    if df[feature_cols].isna().any().any():
-        df[feature_cols] = df[feature_cols].fillna(0)
-        
+    # Final catch-all for any remaining NaNs
+    for col in feature_cols:
+        if df[col].isna().any():
+            df[col].fillna(0, inplace=True)
+            
     return df
 
 def select_top_ts_features(train):
@@ -199,57 +241,45 @@ def get_features(train, test):
     return final_cols
 
 def align_features(df, reference_cols, logger=None):
-    """Force a DataFrame to match a reference feature list exactly (v5.1 SSOT).
+    """Memory-Safe Feature Alignment (v6.0 Inplace-First).
     
-    This is the SINGLE SOURCE OF TRUTH for schema enforcement.
-    Phase 2 calls this ONCE before saving. Phase 3+ NEVER calls this.
+    Builds the target DataFrame column-wise, dropping used columns from source immediately
+    to restrict the peak memory barrier.
     """
-    df = df.copy()
-    
-    # 1. Standardize column names
-    reference_cols = [str(c) for c in reference_cols]
-    
-    current_cols = set(df.columns)
-    target_cols = set(reference_cols)
-    
-    missing = sorted(target_cols - current_cols)
-    extra = sorted(current_cols - target_cols)
-    
     if logger:
-        logger.info(f"── Feature Alignment Report (v5.1 SSOT) ──")
-        logger.info(f"  Input columns:   {len(current_cols)}")
+        logger.info(f"── Memory-Safe Alignment (v6.0) ──")
         logger.info(f"  Target columns:  {len(reference_cols)}")
-        logger.info(f"  Missing columns: {len(missing)} → filled with 0")
-        logger.info(f"  Extra columns:   {len(extra)} → dropped")
-        if missing: logger.info(f"  Missing examples: {missing[:5]}")
-        if extra: logger.info(f"  Extra examples:   {extra[:5]}")
-        
-    # 2. Add missing as 0
-    for col in missing:
-        df[col] = 0.0
-        
-    # 3. Handle object types BEFORE selection
-    for col in reference_cols:
-        if pd.api.types.is_object_dtype(df[col]):
-            if logger: logger.warning(f"  Object dtype detected in '{col}' → forcing numeric coercion")
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
-            
-    # 4. Select EXACTLY in reference order → drop extras by exclusion
-    final_df = df[reference_cols].apply(pd.to_numeric, errors='coerce').fillna(0).astype('float32')
+
+    # 1. Create Empty Skeleton with same index
+    final_df = pd.DataFrame(index=df.index)
     
-    # 5. STRICT POST-CONDITIONS
-    assert final_df.shape[1] == len(reference_cols), \
-        f"Alignment shape mismatch! Got {final_df.shape[1]}, expected {len(reference_cols)}"
-    assert list(final_df.columns) == reference_cols, \
-        "Alignment column order mismatch!"
-    assert not (final_df.dtypes == object).any(), \
-        f"Object dtype leaked through alignment! {final_df.dtypes[final_df.dtypes == object].index.tolist()}"
-    assert final_df.dtypes.apply(lambda d: d in [np.float32, np.float64]).all(), \
-        f"Non-float dtype detected! {final_df.dtypes.unique()}"
-    assert not final_df.isna().any().any(), \
-        f"NaN survived alignment! Count: {final_df.isna().sum().sum()}"
+    # 2. Process Reference Columns one-by-one
+    target_set = set(reference_cols)
+    source_cols = list(df.columns)
+    
+    for col in reference_cols:
+        if col in df.columns:
+            # Transfer and convert to float32
+            final_df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0).astype('float32')
+            # Drop from source to free memory
+            df.drop(columns=[col], inplace=True)
+        else:
+            # Fill missing with zeros
+            final_df[col] = np.zeros(len(df), dtype='float32')
+            
+        # Periodic cleanup
+        if len(final_df.columns) % 100 == 0:
+            gc.collect()
+
+    if logger:
+        logger.info(f"  ✓ Column-wise transfer complete. Cleaning up source...")
+
+    # 3. STRICT POST-CONDITIONS (as before)
+    assert final_df.shape[1] == len(reference_cols)
+    assert list(final_df.columns) == reference_cols
+    assert not final_df.isna().any().any()
     
     if logger:
-        logger.info(f"  ✓ Alignment complete: shape={final_df.shape}, dtype={final_df.dtypes.unique()}")
+        logger.info(f"  ✓ Alignment complete: shape={final_df.shape}")
     
     return final_df

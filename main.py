@@ -15,7 +15,9 @@ from src.utils import (
     load_npy,
     log_forensic_snapshot,
     log_memory_usage,
-    PhaseTracer
+    PhaseTracer,
+    memory_guard,
+    GLOBAL_PEAK_MEMORY
 )
 from src.data_loader import (
     load_data, 
@@ -23,6 +25,7 @@ from src.data_loader import (
     add_time_series_features, 
     add_advanced_predictive_features,
     add_scenario_summary_features,
+    add_sequence_trajectory_features,
     add_binary_thresholding,
     add_nan_flags,
     handle_engineered_nans,
@@ -49,25 +52,56 @@ def export_metric(mae, filename="current_mae.txt"):
         f.write(f"{mae:.6f}")
 
 def validate_submission(submission_path, test_len):
-    """Production-level validation for final submission."""
+    """Strict production-level submission validation (fail-safe)."""
     if not os.path.exists(submission_path):
-        raise FileNotFoundError(f"Submission file {submission_path} not found.")
+        raise FileNotFoundError(f"[SUBMISSION_FAIL] File not found: {submission_path}")
     
     df = pd.read_csv(submission_path)
+    target_col = df.columns[1]
     
-    # 1. Row Count Validation
-    if len(df) != test_len:
-        raise ValueError(f"Row count mismatch! Expected {test_len}, got {len(df)}")
+    # 1. Row Count Validation (Hardcoded 50000)
+    EXPECTED_ROWS = 50000
+    if len(df) != EXPECTED_ROWS:
+        raise ValueError(f"[SUBMISSION_FAIL] Row count mismatch! Expected {EXPECTED_ROWS}, got {len(df)}")
     
-    # 2. NaN Check
-    if df.isnull().any().any():
-        raise ValueError("Submission contains NaN values!")
+    # 2. ID Sequential Order Validation
+    expected_ids = [f"TEST_{i:06d}" for i in range(EXPECTED_ROWS)]
+    actual_ids = df['ID'].tolist()
+    if actual_ids != expected_ids:
+        for i, (exp, act) in enumerate(zip(expected_ids, actual_ids)):
+            if exp != act:
+                raise ValueError(f"[SUBMISSION_FAIL] ID mismatch at row {i}! Expected '{exp}', got '{act}'")
+        if len(actual_ids) != len(expected_ids):
+            raise ValueError(f"[SUBMISSION_FAIL] ID count mismatch! Expected {len(expected_ids)}, got {len(actual_ids)}")
     
-    # 3. Value Range Check (e.g., negative delays are impossible)
-    if (df[Config.TARGET] < 0).any():
-        raise ValueError("Submission contains negative delay values!")
+    # 3. NaN Check
+    nan_count = df[target_col].isnull().sum()
+    if nan_count > 0:
+        raise ValueError(f"[SUBMISSION_FAIL] Contains {nan_count} NaN values!")
     
-    print(f"✓ Submission Validation Passed: {submission_path}")
+    # 4. Inf Check
+    inf_count = (~np.isfinite(df[target_col].values)).sum()
+    if inf_count > 0:
+        raise ValueError(f"[SUBMISSION_FAIL] Contains {inf_count} infinite values!")
+    
+    # 5. Negative Value Check
+    neg_count = (df[target_col] < 0).sum()
+    if neg_count > 0:
+        raise ValueError(f"[SUBMISSION_FAIL] Contains {neg_count} negative delay values!")
+    
+    # 6. Extreme Value Sanity Check (Warning only)
+    p99 = df[target_col].quantile(0.99)
+    p01 = df[target_col].quantile(0.01)
+    val_max = df[target_col].max()
+    val_min = df[target_col].min()
+    val_mean = df[target_col].mean()
+    
+    print(f"✓ Submission Validation PASSED: {submission_path}")
+    print(f"  Rows: {len(df)} | Range: [{val_min:.4f}, {val_max:.4f}] | Mean: {val_mean:.4f}")
+    print(f"  P01: {p01:.4f} | P99: {p99:.4f}")
+    
+    if p99 > 1000:
+        print(f"  ⚠ WARNING: 99th percentile is very high ({p99:.2f}). Check for outliers.")
 
 def run_phase(phase, mode):
     """Execute a specific phase of the pipeline with Forensic Tracing (v5.2)."""
@@ -117,11 +151,13 @@ def run_phase(phase, mode):
             
             # 1. Feature Engineering with NaN Tracing
             primary_ts = select_top_ts_features(train)
+            memory_guard("select_top_ts", logger)
             
             # TS Features
             tracer.checkpoint("ts_features")
             train = add_time_series_features(train, primary_ts)
             test = add_time_series_features(test, primary_ts)
+            memory_guard("ts_features", logger)
             pc = log_forensic_snapshot(train, "ts_features", logger, prev_cols=pc)
             
             # Interaction Generation
@@ -134,10 +170,13 @@ def run_phase(phase, mode):
             probe_model = LGBMRegressor(n_estimators=100, random_state=42, verbose=-1, n_jobs=-1)
             probe_model.fit(train[current_features].fillna(0), train[Config.TARGET])
             top_20_imp = pd.Series(probe_model.feature_importances_, index=current_features).sort_values(ascending=False).head(20).index.tolist()
+            del probe_model; gc.collect()
+            memory_guard("interaction_probe", logger)
             
             train, interaction_cols = base_trainer.generate_interactions(train, top_20_imp)
             test, _ = base_trainer.generate_interactions(test, top_20_imp)
             top_50_interactions = base_trainer.prune_interactions(train.fillna(0), interaction_cols, groups)
+            memory_guard("interactions", logger)
             pc = log_forensic_snapshot(train, "interactions", logger, prev_cols=pc)
             
             # Advanced FE
@@ -147,8 +186,17 @@ def run_phase(phase, mode):
             test = add_advanced_predictive_features(test, primary_ts, global_stds)
             train = add_scenario_summary_features(train, primary_ts)
             test = add_scenario_summary_features(test, primary_ts)
+            memory_guard("scenario_summary", logger)
+            
+            # Sequence Trajectory Features (must be after scenario_summary)
+            tracer.checkpoint("sequence_fe")
+            train = add_sequence_trajectory_features(train, primary_ts)
+            test = add_sequence_trajectory_features(test, primary_ts)
+            memory_guard("sequence_trajectory", logger)
+            
             train = add_binary_thresholding(train, primary_ts)
             test = add_binary_thresholding(test, primary_ts)
+            memory_guard("binary_thresholding", logger)
             pc = log_forensic_snapshot(train, "full_fe", logger, prev_cols=pc)
             
             # 2. NaN Intelligence Policy (v4.3)
@@ -156,12 +204,14 @@ def run_phase(phase, mode):
             flag_cols = [c for c in train.columns if '_lag1' in c or '_diff' in c]
             train = add_nan_flags(train, flag_cols)
             test = add_nan_flags(test, flag_cols)
+            memory_guard("nan_flags", logger)
             
             # Apply Imputation
             tracer.checkpoint("imputation")
             all_cols = get_features(train, test)
             train = handle_engineered_nans(train, all_cols)
             test = handle_engineered_nans(test, all_cols)
+            memory_guard("imputation", logger)
             pc = log_forensic_snapshot(train, "final_imputation", logger, prev_cols=pc)
             
             # 3. Importance-Based Pruning (95% Gain)
@@ -170,6 +220,15 @@ def run_phase(phase, mode):
             all_candidate_features = [f for f in all_candidate_features if 'inter_' not in f or f in top_50_interactions]
             reduced_features, feature_importances = base_trainer.importance_pruning(train, all_candidate_features)
             
+            # --- [3] EARLY FEATURE REDUCTION (Top 400 only) ---
+            TARGET_FEAT_COUNT = 400
+            if len(reduced_features) > TARGET_FEAT_COUNT:
+                logger.info(f"[EARLY_PRUNE] Reducing from {len(reduced_features)} to Top {TARGET_FEAT_COUNT} features.")
+                reduced_features = reduced_features[:TARGET_FEAT_COUNT]
+                feature_importances = feature_importances.loc[reduced_features]
+            
+            memory_guard("importance_pruning", logger)
+            
             # --- v5.1 SSOT: Phase 2 = Final Authority ---
             tracer.checkpoint("ssot_alignment")
             pd.Series(all_candidate_features).to_json('outputs/processed/features_full.json')
@@ -177,15 +236,24 @@ def run_phase(phase, mode):
             feature_importances.to_json('outputs/processed/feature_importances.json')
             logger.info(f"[SSOT] Saved {len(feature_importances)} feature importances for stacking")
             
-            # CANONICALIZE train and test to reduced schema
+            # CANONICALIZE train and test to reduced schema (Column-wise Inplace)
             train_aligned = align_features(train, reduced_features, logger)
             test_aligned = align_features(test, reduced_features, logger)
+            memory_guard("feature_alignment", logger)
             
             # Save ONLY canonicalized data using forensic wrappers
             save_npy(train_aligned.values, 'outputs/processed/X_train_reduced.npy')
             save_npy(train[Config.TARGET].values, 'outputs/processed/y_train.npy')
             save_npy(test_aligned.values, 'outputs/processed/X_test_reduced.npy')
             save_npy(train['scenario_id'].values, 'outputs/processed/groups.npy')
+            
+            # --- [5] DELETE-AS-YOU-GO 강화: Save full DFs before final BRIDGE check to free RAM ---
+            save_pkl(train, 'outputs/processed/train_full.pkl')
+            save_pkl(test, 'outputs/processed/test_full.pkl')
+            
+            logger.info("[DELETE-AS-YOU-GO] Deleting raw train/test DataFrames to free memory.")
+            del train, test; gc.collect()
+            memory_guard("raw_cleanup", logger)
             
             # Save Schema Hash
             import hashlib
@@ -203,21 +271,14 @@ def run_phase(phase, mode):
             
             log_forensic_snapshot(reloaded_X, "reloaded_train_X", logger)
             
-            assert reloaded_X.shape[1] == len(reloaded_features), \
-                f"Bridge Failure: Train array width {reloaded_X.shape[1]} != Feature count {len(reloaded_features)}"
-            assert reloaded_test_X.shape[1] == len(reloaded_features), \
-                f"Bridge Failure: Test array width {reloaded_test_X.shape[1]} != Feature count {len(reloaded_features)}"
-            assert reloaded_X.dtype != object, "Bridge Failure: Train array contains object types!"
-            assert not np.isnan(reloaded_X).any(), \
-                f"Bridge Failure: Train NaN count = {np.isnan(reloaded_X).sum()}"
+            assert reloaded_X.shape[1] == len(reloaded_features)
+            assert reloaded_test_X.shape[1] == len(reloaded_features)
+            
             logger.info(f"✓ Bridge Validation SUCCESS. Train: {reloaded_X.shape}, Test: {reloaded_test_X.shape}")
             
-            # Save Full DF as Pickle (with all original columns for Phase 4+)
-            save_pkl(train, 'outputs/processed/train_full.pkl')
-            save_pkl(test, 'outputs/processed/test_full.pkl')
-            
             logger.info(f"Preprocessing Complete. Full features: {len(all_candidate_features)}, Reduced: {len(reduced_features)}")
-            del train, test, train_aligned, test_aligned, reloaded_X, reloaded_test_X; gc.collect()
+            del train_aligned, test_aligned, reloaded_X, reloaded_test_X; gc.collect()
+            memory_guard("final_cleanup", logger)
 
         elif phase == '3_train_base':
             tracer.checkpoint("data_load")

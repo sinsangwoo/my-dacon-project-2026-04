@@ -58,6 +58,36 @@ def get_process_memory():
         pass
     return 0.0
 
+GLOBAL_PEAK_MEMORY = 0.0
+
+def memory_guard(label, logger, threshold=0.8):
+    """Memory Guard System (v6.0).
+    Checks system RAM usage. If > threshold (default 80%), triggers aggressive GC.
+    """
+    total_ram = get_system_ram()
+    proc_mem = get_process_memory()
+    
+    # Update peak
+    global GLOBAL_PEAK_MEMORY
+    if proc_mem > GLOBAL_PEAK_MEMORY:
+        GLOBAL_PEAK_MEMORY = proc_mem
+        
+    # Check system-wide RAM usage if possible (simplified for Windows/Linux)
+    # Using a heuristic if precise system-wide available memory is hard to get
+    # For now, focus on process-level guard against a fixed limit (e.g. 12GB)
+    SAFE_LIMIT_MB = total_ram * threshold
+    
+    if proc_mem > SAFE_LIMIT_MB:
+        logger.warning(f"!!! [MEMORY_GUARD] High RAM Detection ({proc_mem:.1f} MB > {SAFE_LIMIT_MB:.1f} MB) !!!")
+        logger.info("[MEMORY_GUARD] Triggering aggressive Garbage Collection...")
+        gc.collect()
+        new_mem = get_process_memory()
+        logger.info(f"[MEMORY_GUARD] GC Complete. Memory: {proc_mem:.1f} -> {new_mem:.1f} MB")
+        return False # Warning status
+    
+    logger.info(f"[MEMORY_GUARD] {label} | System Healthy | Process: {proc_mem:.1f} MB (Peak: {GLOBAL_PEAK_MEMORY:.1f} MB)")
+    return True
+
 def log_memory_usage(data, label, logger):
     """Memory Tracking with Process-level Telemetry (v5.3)."""
     obj_mb = 0.0

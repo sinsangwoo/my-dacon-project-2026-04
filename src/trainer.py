@@ -465,18 +465,66 @@ class Trainer:
         return importances.sort_values(ascending=False).head(Config.INT_PRUNE_K).index.tolist()
 
     def importance_pruning(self, train_df, feature_cols):
-        """Identify features contributing to 95% of cumulative gain. Returns (features, importances)."""
-        logger.info(f"Running Probe LGBM for Importance Pruning...")
-        params = Config.LGBM_PARAMS.copy()
-        params.update({'n_estimators': 200, 'learning_rate': 0.1, 'n_jobs': -1})
-        probe_model = LGBMRegressor(**params)
-        probe_model.fit(train_df[feature_cols], train_df[Config.TARGET])
-        importances = pd.Series(probe_model.feature_importances_, index=feature_cols).sort_values(ascending=False)
-        cum_importance = importances.cumsum() / importances.sum()
-        selected_features = cum_importance[cum_importance <= Config.IMPORTANCE_THRESHOLD].index.tolist()
+        """Robust importance pruning with multi-seed stability analysis.
+        
+        Returns (selected_features, mean_importances).
+        Uses 3 seeds to compute importance mean + CV ratio.
+        Features with high variance relative to their importance are removed.
+        """
+        logger.info(f"Running Robust Multi-Seed Importance Pruning...")
+        n_probe_seeds = 3
+        all_importances = []
+        
+        for i in range(n_probe_seeds):
+            params = Config.LGBM_PARAMS.copy()
+            params.update({'n_estimators': 200, 'learning_rate': 0.1, 'n_jobs': -1, 'random_state': 42 + i})
+            probe = LGBMRegressor(**params)
+            probe.fit(train_df[feature_cols], train_df[Config.TARGET])
+            imp = pd.Series(probe.feature_importances_, index=feature_cols)
+            all_importances.append(imp)
+            logger.info(f"[ROBUST_SELECTION] Probe seed {42+i} done. Non-zero features: {(imp > 0).sum()}")
+            
+            # CRITICAL: Immediate cleanup
+            del probe; gc.collect()
+        
+        imp_df = pd.DataFrame(all_importances)
+        mean_imp = imp_df.mean().sort_values(ascending=False)
+        std_imp = imp_df.std()
+        
+        # CV ratio: std / mean (higher = less stable)
+        cv_ratio = std_imp / (mean_imp + 1e-9)
+        
+        # Remove high-variance features (CV > 1.0 means std exceeds mean)
+        unstable_mask = cv_ratio > 1.0
+        unstable_features = cv_ratio[unstable_mask].index.tolist()
+        stable_imp = mean_imp.drop(unstable_features, errors='ignore')
+        
+        # Cumulative importance selection on stable features
+        if stable_imp.sum() > 0:
+            cum_importance = stable_imp.cumsum() / stable_imp.sum()
+            selected_features = cum_importance[cum_importance <= Config.IMPORTANCE_THRESHOLD].index.tolist()
+        else:
+            selected_features = []
+        
         if not selected_features:
-            selected_features = importances.head(100).index.tolist()
-        return selected_features, importances
+            selected_features = stable_imp.head(100).index.tolist()
+        
+        # Stability Logging
+        logger.info(f"[ROBUST_SELECTION] Total candidates: {len(feature_cols)}")
+        logger.info(f"[ROBUST_SELECTION] Unstable removed (CV>1.0): {len(unstable_features)}")
+        logger.info(f"[ROBUST_SELECTION] Stable remaining: {len(stable_imp)}")
+        logger.info(f"[ROBUST_SELECTION] Selected (95% gain): {len(selected_features)}")
+        if unstable_features:
+            logger.info(f"[ROBUST_SELECTION] Unstable examples: {unstable_features[:5]}")
+        
+        # Top 10 stability report
+        top10 = mean_imp.head(10)
+        top10_cv = cv_ratio[top10.index]
+        for feat, imp_val, cv_val in zip(top10.index, top10.values, top10_cv.values):
+            status = "✓" if cv_val <= 1.0 else "✗"
+            logger.info(f"[ROBUST_SELECTION] {status} {feat}: importance={imp_val:.1f}, CV={cv_val:.3f}")
+        
+        return selected_features, mean_imp
 
     def filter_unstable_features(self, feature_cols, importance_list):
         if not importance_list: return feature_cols

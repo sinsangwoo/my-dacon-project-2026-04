@@ -4,6 +4,8 @@
 MODE="full"
 if [ "$1" == "debug" ]; then
     MODE="debug"
+elif [ "$1" == "trace" ]; then
+    MODE="trace"
 fi
 
 HALT_ON_REGRESSION=false

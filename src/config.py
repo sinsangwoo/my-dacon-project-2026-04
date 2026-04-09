@@ -6,6 +6,9 @@ class Config:
     DEBUG_PHASE3 = False # For Phase 3 logic testing
     DEBUG_MINIMAL = False # Full pipeline sanity check (< 10s)
     DEBUG_MINIMAL_ROWS = 100
+    TRACE_MODE = False    # Forensic Audit Trace Mode
+    TRACE_ROWS = 1000     # Default rows for trace mode
+    MEMORY_THRESHOLD_GB = 1.5 # Warning threshold for memory footprint
     
     # Paths
     DATA_PATH = './data/'
@@ -31,7 +34,7 @@ class Config:
     SPLIT_STRATEGY = 'GroupKFold' 
     ADAPTIVE_FOLDS = {'full': 5, 'debug': 2}
     NFOLDS = ADAPTIVE_FOLDS[MODE]
-    SEEDS = [42, 43, 44] if MODE == 'full' else [42]
+    SEEDS = [42, 43, 44, 45, 46] if MODE == 'full' else [42]
     STABILITY_VAR_THRESHOLD = 0.5
     OVERFITTING_GAP_THRESHOLD = 0.2
     
@@ -40,10 +43,12 @@ class Config:
     
     # Stacking
     META_MODEL = 'ridge' # 'ridge' or 'lgbm'
+    STACKING_TOP_K = 30  # Top features to include in stacking meta-model
     
     # Pseudo Labeling
     PSEUDO_RATIOS = [0.1, 0.2, 0.3] if MODE == 'full' else []
     MAX_PSEUDO_RATIO = 0.3
+    PSEUDO_WEIGHTS = [0.3, 0.5, 0.7] if MODE == 'full' else [0.5]
     
     # Model Hyperparameters - LightGBM
     LGBM_PARAMS = {

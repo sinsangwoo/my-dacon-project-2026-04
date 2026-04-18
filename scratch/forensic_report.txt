@@ -1,0 +1,70 @@
+## 1. FULL PIPELINE TRACE (MANDATORY)
+[TRACE]
+phase_name: 3_train_base
+input_type: numpy.ndarray (from load_npy)
+output_type: numpy.ndarray
+columns: 200 columns
+shape: X_train=(250000, 200), X_test=(50000, 200)
+
+[TRANSITION_LOG]
+location: main.py L367 ensure_dataframe
+before_type: numpy.ndarray
+after_type: pandas.DataFrame
+column_preserved: TRUE
+
+[TRANSITION_LOG]
+location: src/trainer.py L249 X = train_df[feature_cols].values
+before_type: pandas.DataFrame
+after_type: numpy.ndarray
+column_preserved: FALSE (values strips columns)
+
+## 2. MODEL FIT VS PREDICT CONSISTENCY CHECK
+[MODEL_AUDIT]
+model_id: stable_fold_0
+fit:
+type: <class 'numpy.ndarray'>
+columns: None
+n_features: 200
+predict:
+type: <class 'numpy.ndarray'>
+columns: None
+n_features: 200
+mismatch_flag: FALSE
+
+## 5. SKLEARN / PIPELINE INTERFACE AUDIT
+[SKLEARN_AUDIT]
+component: eval_set parameter in LGBMRegressor.fit
+input_type: list of tuples (numpy.ndarray, numpy.ndarray)
+output_type: None
+feature_name_preserved: FALSE
+
+## 8. WARNING TRIGGER POINT IDENTIFICATION
+[WARNING_ORIGIN]
+Warning trace:
+Warning: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+
+## 9. REPRODUCIBILITY TEST
+TRIGGERED WARNING: X does not have valid feature names, but LGBMRegressor was fitted with feature names
+[MINIMAL_REPRO]
+warning_reproduced: TRUE
+conditions: model.fit(DataFrame), model.predict(numpy_array)
+
+## 6. MULTIPLE MODEL INTERACTION CHECK
+[SCHEMA_CONSISTENCY]
+model_1 vs model_2:
+same_columns: TRUE
+same_order: TRUE
+
+## 3. FEATURE ORDER INTEGRITY CHECK
+[FEATURE_ORDER_CHECK]
+model_id: stable_fold_0
+identical_order: TRUE
+missing_columns: None
+extra_columns: None
+reordered: FALSE
+
+## 7. INFERENCE PIPELINE AUDIT (CRITICAL)
+[INFERENCE_TRACE]
+final_input_type: numpy.ndarray (X_test)
+final_columns: None
+origin_pipeline_stage: phase 2 load -> extract DataFrame values -> pass to model.predict

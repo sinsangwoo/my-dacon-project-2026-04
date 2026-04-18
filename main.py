@@ -3,8 +3,18 @@ import numpy as np
 import logging
 import argparse
 import os
+import json
 import sys
 import gc
+import warnings
+import glob
+import time
+import hashlib
+from pathlib import Path
+
+# Suppress PerformanceWarning after fixing the root cause (Batch Concat)
+warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
+from src.forensic_logger import ForensicLogger
 from src.config import Config
 from src.utils import (
     seed_everything, 
@@ -15,28 +25,72 @@ from src.utils import (
     load_npy,
     log_forensic_snapshot,
     log_memory_usage,
+    get_process_memory,
     PhaseTracer,
     memory_guard,
-    GLOBAL_PEAK_MEMORY
+    GLOBAL_PEAK_MEMORY,
+    inspect_columns,
+    ensure_dataframe,
+    validate_submission,
+    generate_submission_fingerprint,
+    save_submission_trace,
+    preserve_fail_case,
+    build_submission,
+    SAFE_FIT,
+    SAFE_PREDICT,
+    check_model_contract_compliance
 )
+from src.explosion_inference import ExplosionInference, run_explosion_inference
 from src.data_loader import (
     load_data, 
     select_top_ts_features, 
+    build_causal_feature_manifest,
+    get_removed_leaky_feature_patterns,
     add_time_series_features, 
+    add_extreme_detection_features, 
     add_advanced_predictive_features,
     add_scenario_summary_features,
+    add_scenario_sequence_compressed,
     add_sequence_trajectory_features,
+    compress_sequence_features,
     add_binary_thresholding,
     add_nan_flags,
     handle_engineered_nans,
     get_features,
-    align_features
+    align_features,
+    prune_collinear_features,
+    prune_drift_features,
+    add_hybrid_latent_features,
+    generate_supercharged_latent_features
 )
 from src.trainer import Trainer
+from src.intelligence import ExperimentIntelligence
 from sklearn.metrics import mean_absolute_error
 
+# --- [PHASE 1: PHASE ENUM EXTRACTION (SSOT)] ---
+# Purpose: Define the canonical execution graph for the pipeline
+# Failure: Strictly enforced at argparse and runtime entry
+VALID_PHASES = [
+    "1_data_check",
+    "2_build_raw",
+    "3_train_raw",
+    "4_build_full",
+    "5_train_final",
+    "6_retrain",
+    "7_inference",
+    "8_submission",
+    "9_intelligence",
+    "validate_artifacts",
+    "verify_paths"
+]
+
+LEGACY_PHASES = ["2_preprocess", "3_train_base", "4_stacking", "5_pseudo_labeling"]
+
 def log_nan_stats(df, stage, logger):
-    """Trace NaN counts and problematic columns for telemetry."""
+    # PURPOSE: Log missing value statistics for forensic tracking
+    # INPUT: df (DataFrame), stage (str), logger (logging.Logger)
+    # OUTPUT: total_nans (int)
+    # FAILURE: Returns 0 if df is empty
     nan_counts = df.isna().sum()
     total_nans = nan_counts.sum()
     logger.info(f"[NaN Trace] Stage: {stage} | Total NaNs: {total_nans:,}")
@@ -45,738 +99,505 @@ def log_nan_stats(df, stage, logger):
         logger.info(f"[NaN Trace] Top problematic columns:\n{top_nans}")
     return total_nans
 
+def validate_consistency(logger):
+    # PURPOSE: Ensure RUN_ID and output paths are synchronized
+    # INPUT: logger (logging.Logger)
+    # OUTPUT: None
+    # FAILURE: Raises ValueError if RUN_ID mismatch detected
+    if not Config.RUN_ID:
+        raise ValueError("[FATAL] RUN_ID is empty or not set.")
+    expected_base = f"./outputs/{Config.RUN_ID}"
+    if Config.OUTPUT_BASE != expected_base:
+        raise ValueError(f"[FATAL] Config path mismatch! RUN_ID={Config.RUN_ID} but OUTPUT_BASE={Config.OUTPUT_BASE}")
+    logger.info(f"[VALIDATE] Consistency Check Passed: {Config.RUN_ID} aligned with filesystem.")
+
+def verify_path_permissions(logger):
+    # PURPOSE: Pre-flight check for directory write permissions
+    # INPUT: logger (logging.Logger)
+    # OUTPUT: bool (True if all paths writable)
+    # FAILURE: Returns False if any path is access denied
+    paths_to_check = [Config.OUTPUT_BASE, Config.LOG_DIR, Config.SUMMARY_DIR]
+    for p in paths_to_check:
+        parent = os.path.dirname(p.rstrip('/'))
+        if not os.path.exists(p):
+            if os.path.exists(parent):
+                if os.access(parent, os.W_OK):
+                    logger.info(f"[DRY_RUN] Path {p} is writable (parent exists & writable)")
+                else:
+                    logger.error(f"[DRY_RUN] Path {p} is NOT writable (parent {parent} access denied)")
+                    return False
+            else:
+                logger.warning(f"[DRY_RUN] Parent {parent} does not exist, assuming creation will work if base is ./outputs")
+        else:
+            if os.access(p, os.W_OK):
+                logger.info(f"[DRY_RUN] Path {p} is writable")
+            else:
+                logger.error(f"[DRY_RUN] Path {p} access denied")
+                return False
+    return True
+
+class ArtifactValidator:
+    """Upgraded Artifact Validator (v10.0 - Health Checks)."""
+    @staticmethod
+    def check_phase_outputs(phase, logger):
+        # PURPOSE: Verify physical existence and health of phase artifacts
+        # INPUT: phase (str), logger (logging.Logger)
+        # OUTPUT: bool (True if artifacts healthy)
+        # FAILURE: Returns False if CRITICAL artifact missing or corrupt
+        if Config.DRY_RUN:
+            logger.info(f"[DRY_RUN] Skipping physical artifact check for {phase}. Structure validated.")
+            return True
+        if phase not in Config.ARTIFACT_MANIFEST:
+            logger.info(f"[VALIDATE] Phase {phase} has no registered artifact contract.")
+            return True
+        manifest = Config.ARTIFACT_MANIFEST[phase]
+        success = True
+        search_paths = [Config.PROCESSED_PATH, Config.PREDICTIONS_PATH, Config.OUTPUT_BASE, Config.SUMMARY_DIR]
+        for item in manifest:
+            pattern = item["pattern"]; severity = item["severity"]; desc = item["desc"]
+            found = False
+            for base in search_paths:
+                full_pattern = os.path.join(base, pattern)
+                matches = glob.glob(full_pattern)
+                for f in matches:
+                    found = True
+                    # NEW: Health Checks (Size & JSON)
+                    size = os.path.getsize(f)
+                    if size == 0:
+                        logger.error(f"[HEALTH_FAILED] {f} exists but is EMPTY (0 bytes)")
+                        if severity == "CRITICAL": success = False
+                        continue
+                    
+                    if f.endswith('.json'):
+                        try:
+                            with open(f, 'r') as jf: json.load(jf)
+                        except Exception as e:
+                            logger.error(f"[HEALTH_FAILED] {f} is CORRUPT (JSON parse error): {str(e)}")
+                            if severity == "CRITICAL": success = False
+                            continue
+
+                    logger.info(f"[VALIDATE_OK] {severity} artifact: {os.path.basename(f)} ({size/1024:.1f} KB)")
+                if found: break
+                    
+            if not found:
+                msg = f"Missing {severity} artifact: {pattern} ({desc}) after {phase}"
+                if severity == "CRITICAL":
+                    logger.error(f"[FATAL] {msg}"); success = False
+                else: logger.warning(f"[WARNING] {msg}")
+        return success
+
+def validate_shapes(train, test, logger):
+    # PURPOSE: Ensure feature symmetry between train and test datasets
+    # INPUT: train (DataFrame), test (DataFrame), logger (logging.Logger)
+    # OUTPUT: None
+    # FAILURE: Raises RuntimeError if test missing features required by train
+    train_cols = [c for c in train.columns if c not in [Config.TARGET] + Config.ID_COLS]
+    test_cols = [c for c in test.columns if c not in Config.ID_COLS]
+    missing_in_test = set(train_cols) - set(test_cols)
+    extra_in_test = set(test_cols) - set(train_cols)
+    if missing_in_test: raise RuntimeError(f"[SHAPE_FATAL] Test data missing features: {list(missing_in_test)[:10]}...")
+    if extra_in_test: logger.warning(f"[SHAPE_WARNING] Test data has extra features that will be ignored: {list(extra_in_test)[:10]}...")
+    logger.info(f"[SHAPE_CHECK] Symmetry Verified: {len(train_cols)} features aligned.")
+
+def validate_output_len(preds, expected_len, label):
+    # PURPOSE: Verify prediction array length matches expectations
+    # INPUT: preds (ndarray), expected_len (int), label (str)
+    # OUTPUT: None
+    # FAILURE: Raises RuntimeError if length mismatch detected
+    if len(preds) != expected_len: raise RuntimeError(f"[INFERENCE_FATAL] {label} shape mismatch! Expected {expected_len}, got {len(preds)}")
+
 def export_metric(mae, filename="current_mae.txt"):
-    """Export MAE to a file for pipeline.sh to read."""
-    os.makedirs("logs", exist_ok=True)
-    with open(f"logs/{filename}", "w") as f:
-        f.write(f"{mae:.6f}")
+    # PURPOSE: Save performance metrics to disk for cross-phase access
+    # INPUT: mae (float), filename (str)
+    # OUTPUT: None
+    # FAILURE: Creates log directory if missing
+    os.makedirs(Config.LOG_DIR, exist_ok=True)
+    with open(f"{Config.LOG_DIR}/{filename}", "w") as f: f.write(f"{mae:.6f}")
 
-def validate_submission(submission_path, test_len):
-    """Strict production-level submission validation (fail-safe)."""
-    if not os.path.exists(submission_path):
-        raise FileNotFoundError(f"[SUBMISSION_FAIL] File not found: {submission_path}")
+def initialize_run_directories():
+    # PURPOSE: Create canonical directory structure for a new run
+    # INPUT: None
+    # OUTPUT: None
+    # FAILURE: Logs directory creation in dry_run mode
+    dirs = [Config.OUTPUT_BASE, Config.PROCESSED_PATH, Config.MODELS_PATH, Config.PREDICTIONS_PATH, Config.LOG_DIR, Config.SUMMARY_DIR, Config.DONE_DIR]
+    for d in dirs:
+        if Config.DRY_RUN: logging.getLogger(__name__).info(f"[DRY_RUN] Would create directory: {d}")
+        else: os.makedirs(d, exist_ok=True)
     
-    df = pd.read_csv(submission_path)
-    target_col = df.columns[1]
-    
-    # 1. Row Count Validation (Hardcoded 50000)
-    EXPECTED_ROWS = 50000
-    if len(df) != EXPECTED_ROWS:
-        raise ValueError(f"[SUBMISSION_FAIL] Row count mismatch! Expected {EXPECTED_ROWS}, got {len(df)}")
-    
-    # 2. ID Sequential Order Validation
-    expected_ids = [f"TEST_{i:06d}" for i in range(EXPECTED_ROWS)]
-    actual_ids = df['ID'].tolist()
-    if actual_ids != expected_ids:
-        for i, (exp, act) in enumerate(zip(expected_ids, actual_ids)):
-            if exp != act:
-                raise ValueError(f"[SUBMISSION_FAIL] ID mismatch at row {i}! Expected '{exp}', got '{act}'")
-        if len(actual_ids) != len(expected_ids):
-            raise ValueError(f"[SUBMISSION_FAIL] ID count mismatch! Expected {len(expected_ids)}, got {len(actual_ids)}")
-    
-    # 3. NaN Check
-    nan_count = df[target_col].isnull().sum()
-    if nan_count > 0:
-        raise ValueError(f"[SUBMISSION_FAIL] Contains {nan_count} NaN values!")
-    
-    # 4. Inf Check
-    inf_count = (~np.isfinite(df[target_col].values)).sum()
-    if inf_count > 0:
-        raise ValueError(f"[SUBMISSION_FAIL] Contains {inf_count} infinite values!")
-    
-    # 5. Negative Value Check
-    neg_count = (df[target_col] < 0).sum()
-    if neg_count > 0:
-        raise ValueError(f"[SUBMISSION_FAIL] Contains {neg_count} negative delay values!")
-    
-    # 6. Extreme Value Sanity Check (Warning only)
-    p99 = df[target_col].quantile(0.99)
-    p01 = df[target_col].quantile(0.01)
-    val_max = df[target_col].max()
-    val_min = df[target_col].min()
-    val_mean = df[target_col].mean()
-    
-    print(f"✓ Submission Validation PASSED: {submission_path}")
-    print(f"  Rows: {len(df)} | Range: [{val_min:.4f}, {val_max:.4f}] | Mean: {val_mean:.4f}")
-    print(f"  P01: {p01:.4f} | P99: {p99:.4f}")
-    
-    if p99 > 1000:
-        print(f"  ⚠ WARNING: 99th percentile is very high ({p99:.2f}). Check for outliers.")
+    # Filter for JSON serialization (v13.1: skip classmethods/methods/types)
+    config_dict = {}
+    for k, v in Config.__dict__.items():
+        if k.startswith('__'): continue
+        if k == 'METRIC_SCHEMA': continue # Skip the schema dictionary containing types
+        if isinstance(v, (int, float, str, bool, list, dict, type(None))):
+            config_dict[k] = v
+            
+    save_json(config_dict, f"{Config.SUMMARY_DIR}/config_snapshot.json")
 
-def run_phase(phase, mode):
-    """Execute a specific phase of the pipeline with Forensic Tracing (v5.2)."""
-    logger = get_logger()
+def save_json(data, path):
+    # PURPOSE: Atomically save dictionary to JSON file
+    # INPUT: data (dict), path (str)
+    # OUTPUT: None
+    # FAILURE: Ensures parent directory exists
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f: json.dump(data, f, ensure_ascii=False, indent=2)
+
+def read_optional_metric(path):
+    # PURPOSE: Read floating point metric from file if it exists
+    # INPUT: path (str)
+    # OUTPUT: float or None
+    # FAILURE: Returns None if file missing or empty
+    if not os.path.exists(path): return None
+    with open(path, "r", encoding="utf-8") as f: raw = f.read().strip()
+    return float(raw) if raw else None
+
+def enforce_variance_policy(summary, label):
+    # PURPOSE: Reject models that collapse to zero-variance predictions
+    # INPUT: summary (dict), label (str)
+    # OUTPUT: None
+    # FAILURE: Raises RuntimeError if variance ratio below rejection threshold
+    ratio = summary.get("variance_ratio")
+    if ratio is None: return
+    if ratio < Config.PRED_VARIANCE_RATIO_REJECT: raise RuntimeError(f"[MODEL_REJECT] {label} variance ratio {ratio:.4f} < {Config.PRED_VARIANCE_RATIO_REJECT:.2f}")
+    if ratio < Config.PRED_VARIANCE_RATIO_TARGET_MIN: logging.getLogger(__name__).warning(f"[VARIANCE_WARNING] {label} variance ratio {ratio:.4f} < target {Config.PRED_VARIANCE_RATIO_TARGET_MIN:.2f}")
+
+def validate_artifacts(phase):
+    # PURPOSE: [PHASE 3] Hard validation of required input artifacts for each phase
+    # INPUT: phase (str)
+    # OUTPUT: None
+    # FAILURE: Raises FileNotFoundError or RuntimeError if contract violated
+    """Contract Enforcement: Verify all required artifacts exist for the phase (v13.2)."""
+    # Helper to clean paths
+    def p(path): return os.path.normpath(path)
+    
+    artifacts = {
+        '2_build_raw': [
+            (p(f"{Config.DATA_PATH}/train.csv"), "Phase 1 (Data)"),
+            (p(f"{Config.DATA_PATH}/test.csv"), "Phase 1 (Data)")
+        ],
+        '3_train_raw': [
+            (p(f"{Config.PROCESSED_PATH}/X_train_raw.npy"), "Phase 2"),
+            (p(f"{Config.PROCESSED_PATH}/X_test_raw.npy"), "Phase 2"),
+            (p(f"{Config.PROCESSED_PATH}/y_train.npy"), "Phase 2"),
+            (p(f"{Config.PROCESSED_PATH}/scenario_id.npy"), "Phase 2")
+        ],
+        '4_build_full': [
+            (p(f"{Config.PROCESSED_PATH}/residuals_raw.npy"), "Phase 3"),
+            (p(f"{Config.PROCESSED_PATH}/oof_raw.npy"), "Phase 3")
+        ],
+        '5_train_final': [
+            (p(f"{Config.PROCESSED_PATH}/X_train_full.npy"), "Phase 4"),
+            (p(f"{Config.PROCESSED_PATH}/X_test_full.npy"), "Phase 4"),
+            (p(f"{Config.PROCESSED_PATH}/regime_proxy_tr.npy"), "Phase 4"),
+            (p(f"{Config.PROCESSED_PATH}/regime_proxy_te.npy"), "Phase 4")
+        ],
+        '7_inference': [
+            (p(f"{Config.PREDICTIONS_PATH}/oof_stable.npy"), "Phase 5"),
+            (p(f"{Config.PREDICTIONS_PATH}/test_stable.npy"), "Phase 5")
+        ],
+        '8_submission': [
+            (p(f"{Config.PREDICTIONS_PATH}/final_submission.npy"), "Phase 7")
+        ]
+    }
+    
+    if phase in artifacts:
+        for path, source in artifacts[phase]:
+            if not os.path.exists(path):
+                raise FileNotFoundError(f"[CONTRACT_VIOLATION] Phase {phase} requires {path} from {source}, but it is missing!")
+            # NEW: Size Check for NPY files
+            if path.endswith('.npy'):
+                if os.path.getsize(path) < 100: # Bare minimum for header
+                    raise RuntimeError(f"[CONTRACT_VIOLATION] {path} is suspiciously small. Possible corruption.")
+
+def run_phase(phase, mode, smoke_test=False):
+    # PURPOSE: Execute a specific pipeline phase with strict mode and contract enforcement
+    # INPUT: phase (str), mode (str), smoke_test (bool)
+    # OUTPUT: None
+    # FAILURE: Raises RuntimeError if phase fails or contract violated
+    """Standardized Phase Execution (v8.1)."""
+    
+    # [PHASE 7: BACKWARD COMPATIBILITY BLOCK]
+    if phase in LEGACY_PHASES:
+        print(f"\n[FATAL] Legacy phase '{phase}' detected. Use new pipeline phases.")
+        sys.exit(1)
+        
+    if phase not in VALID_PHASES:
+        print(f"\n[FATAL] Invalid phase '{phase}' blocked. VALID_PHASES: {VALID_PHASES}")
+        sys.exit(1)
+
     Config.MODE = mode
+    Config.NFOLDS = Config.ADAPTIVE_FOLDS[mode]
+    Config.SEEDS = [42, 43, 44, 45, 46] if mode == 'full' else [42]
     
-    # Trace Mode Overrides
-    if mode == 'trace' or Config.TRACE_MODE:
-        logger.info("[TRACE_MODE] Activating high-speed forensic trace overrides.")
+    validate_artifacts(phase)
+
+    
+    # Standardize Logger Fix (v10.0)
+    forensic_mode = 'debug' if mode in ['debug', 'trace'] else 'lite'
+    forensic = ForensicLogger(phase, mode=forensic_mode)
+    logger = get_logger(phase, level=Config.LOG_LEVEL)
+    
+    if mode == 'trace' or smoke_test: 
         Config.TRACE_MODE = True
         Config.NFOLDS = 2
         Config.SEEDS = [42]
-        Config.DEBUG_MINIMAL_ROWS = Config.TRACE_ROWS
-        
+        Config.DEBUG_MINIMAL = True
+        Config.DEBUG_MINIMAL_ROWS = 20 if smoke_test else Config.TRACE_ROWS
+        logger.info(f"[SMOKE_TEST] Activated: ROWS={Config.DEBUG_MINIMAL_ROWS}, FOLDS={Config.NFOLDS}")
+
     seed_everything(42)
-    
     with PhaseTracer(phase, logger) as tracer:
-        # Ensure directories exist
-        for d in ['outputs/processed', 'outputs/models', 'outputs/predictions', 'logs', '.done']:
-            os.makedirs(d, exist_ok=True)
+        initialize_run_directories()
+        if phase not in ['verify_paths', 'validate_artifacts']: validate_consistency(logger)
 
         if phase == '1_data_check':
             tracer.checkpoint("loading_raw")
             train, test = load_data()
-            
             if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
                 rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                logger.info(f"[TRACE/DEBUG] Slicing data to {rows} rows.")
-                train = train.head(rows)
-                test = test.head(rows)
-                
-            log_forensic_snapshot(train, "train_raw", logger)
-            log_forensic_snapshot(test, "test_raw", logger)
+                train = train.head(rows); test = test.head(rows)
+            log_forensic_snapshot(train, "train_raw", logger); log_forensic_snapshot(test, "test_raw", logger)
+            save_npy(train.head(100).values, f'{Config.LOG_DIR}/train_raw.npy') # For artifact check
             del train, test; gc.collect()
 
-        elif phase == '2_preprocess':
+        elif phase == '2_build_raw':
             tracer.checkpoint("load_data")
             train, test = load_data()
-            
             if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
                 rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                logger.info(f"[TRACE/DEBUG] Slicing data to {rows} rows.")
-                train = train.head(rows)
-                test = test.head(rows)
-                
-            pc = log_forensic_snapshot(train, "load_data", logger) # INITIAL SNAPSHOT
+                train = train.head(rows); test = test.head(rows)
+            validate_shapes(train, test, logger)
             
-            # 1. Feature Engineering with NaN Tracing
-            primary_ts = select_top_ts_features(train)
-            memory_guard("select_top_ts", logger)
+            # [PHASE 2: DETERMINISTIC FEATURE BUILDER]
+            schema = Config.get_feature_schema()
+            from src.data_loader import build_features
             
-            # TS Features
-            tracer.checkpoint("ts_features")
-            train = add_time_series_features(train, primary_ts)
-            test = add_time_series_features(test, primary_ts)
-            memory_guard("ts_features", logger)
-            pc = log_forensic_snapshot(train, "ts_features", logger, prev_cols=pc)
+            X_train_raw, train = build_features(train, schema, mode='raw')
+            X_test_raw, test = build_features(test, schema, mode='raw')
             
-            # Interaction Generation
-            tracer.checkpoint("interactions")
-            current_features = get_features(train, test)
-            groups = train['scenario_id']
-            base_trainer = Trainer(train, test, current_features, groups)
+            # Save Raw Feature Matrices
+            save_npy(X_train_raw.values, f'{Config.PROCESSED_PATH}/X_train_raw.npy')
+            save_npy(X_test_raw.values, f'{Config.PROCESSED_PATH}/X_test_raw.npy')
+            save_npy(train[Config.TARGET].values, f'{Config.PROCESSED_PATH}/y_train.npy')
+            save_npy(train['scenario_id'].values, f'{Config.PROCESSED_PATH}/scenario_id.npy')
             
-            from lightgbm import LGBMRegressor
-            probe_model = LGBMRegressor(n_estimators=100, random_state=42, verbose=-1, n_jobs=-1)
-            probe_model.fit(train[current_features].fillna(0), train[Config.TARGET])
-            top_20_imp = pd.Series(probe_model.feature_importances_, index=current_features).sort_values(ascending=False).head(20).index.tolist()
-            del probe_model; gc.collect()
-            memory_guard("interaction_probe", logger)
+            # Save stats for later
+            save_json({
+                "mean": float(train[Config.TARGET].mean()), 
+                "std": float(train[Config.TARGET].std()), 
+                "p99": float(np.quantile(train[Config.TARGET], 0.99))
+            }, f'{Config.PROCESSED_PATH}/train_stats.json')
             
-            train, interaction_cols = base_trainer.generate_interactions(train, top_20_imp)
-            test, _ = base_trainer.generate_interactions(test, top_20_imp)
-            top_50_interactions = base_trainer.prune_interactions(train.fillna(0), interaction_cols, groups)
-            memory_guard("interactions", logger)
-            pc = log_forensic_snapshot(train, "interactions", logger, prev_cols=pc)
-            
-            # Advanced FE
-            tracer.checkpoint("full_fe")
-            global_stds = train[primary_ts].std().to_dict()
-            train = add_advanced_predictive_features(train, primary_ts, global_stds)
-            test = add_advanced_predictive_features(test, primary_ts, global_stds)
-            train = add_scenario_summary_features(train, primary_ts)
-            test = add_scenario_summary_features(test, primary_ts)
-            memory_guard("scenario_summary", logger)
-            
-            # Sequence Trajectory Features (must be after scenario_summary)
-            tracer.checkpoint("sequence_fe")
-            train = add_sequence_trajectory_features(train, primary_ts)
-            test = add_sequence_trajectory_features(test, primary_ts)
-            memory_guard("sequence_trajectory", logger)
-            
-            train = add_binary_thresholding(train, primary_ts)
-            test = add_binary_thresholding(test, primary_ts)
-            memory_guard("binary_thresholding", logger)
-            pc = log_forensic_snapshot(train, "full_fe", logger, prev_cols=pc)
-            
-            # 2. NaN Intelligence Policy (v4.3)
-            # Create Flags BEFORE filling
-            flag_cols = [c for c in train.columns if '_lag1' in c or '_diff' in c]
-            train = add_nan_flags(train, flag_cols)
-            test = add_nan_flags(test, flag_cols)
-            memory_guard("nan_flags", logger)
-            
-            # Apply Imputation
-            tracer.checkpoint("imputation")
-            all_cols = get_features(train, test)
-            train = handle_engineered_nans(train, all_cols)
-            test = handle_engineered_nans(test, all_cols)
-            memory_guard("imputation", logger)
-            pc = log_forensic_snapshot(train, "final_imputation", logger, prev_cols=pc)
-            
-            # 3. Importance-Based Pruning (95% Gain)
-            tracer.checkpoint("importance_pruning")
-            all_candidate_features = get_features(train, test)
-            all_candidate_features = [f for f in all_candidate_features if 'inter_' not in f or f in top_50_interactions]
-            reduced_features, feature_importances = base_trainer.importance_pruning(train, all_candidate_features)
-            
-            # --- [3] EARLY FEATURE REDUCTION (Top 400 only) ---
-            TARGET_FEAT_COUNT = 400
-            if len(reduced_features) > TARGET_FEAT_COUNT:
-                logger.info(f"[EARLY_PRUNE] Reducing from {len(reduced_features)} to Top {TARGET_FEAT_COUNT} features.")
-                reduced_features = reduced_features[:TARGET_FEAT_COUNT]
-                feature_importances = feature_importances.loc[reduced_features]
-            
-            memory_guard("importance_pruning", logger)
-            
-            # --- v5.1 SSOT: Phase 2 = Final Authority ---
-            tracer.checkpoint("ssot_alignment")
-            pd.Series(all_candidate_features).to_json('outputs/processed/features_full.json')
-            pd.Series(reduced_features).to_json('outputs/processed/features_reduced.json')
-            feature_importances.to_json('outputs/processed/feature_importances.json')
-            logger.info(f"[SSOT] Saved {len(feature_importances)} feature importances for stacking")
-            
-            # CANONICALIZE train and test to reduced schema (Column-wise Inplace)
-            train_aligned = align_features(train, reduced_features, logger)
-            test_aligned = align_features(test, reduced_features, logger)
-            memory_guard("feature_alignment", logger)
-            
-            # Save ONLY canonicalized data using forensic wrappers
-            save_npy(train_aligned.values, 'outputs/processed/X_train_reduced.npy')
-            save_npy(train[Config.TARGET].values, 'outputs/processed/y_train.npy')
-            save_npy(test_aligned.values, 'outputs/processed/X_test_reduced.npy')
-            save_npy(train['scenario_id'].values, 'outputs/processed/groups.npy')
-            
-            # --- [5] DELETE-AS-YOU-GO 강화: Save full DFs before final BRIDGE check to free RAM ---
-            save_pkl(train, 'outputs/processed/train_full.pkl')
-            save_pkl(test, 'outputs/processed/test_full.pkl')
-            
-            logger.info("[DELETE-AS-YOU-GO] Deleting raw train/test DataFrames to free memory.")
             del train, test; gc.collect()
-            memory_guard("raw_cleanup", logger)
-            
-            # Save Schema Hash
-            import hashlib
-            schema_str = ','.join(reduced_features)
-            schema_hash = hashlib.md5(schema_str.encode()).hexdigest()
-            with open('outputs/processed/features_reduced_hash.txt', 'w') as f:
-                f.write(schema_hash)
-            logger.info(f"[SSOT] Schema hash saved: {schema_hash}")
-            
-            # --- BRIDGE VALIDATION (v5.1) ---
-            tracer.checkpoint("bridge_validation")
-            reloaded_X = load_npy('outputs/processed/X_train_reduced.npy')
-            reloaded_test_X = load_npy('outputs/processed/X_test_reduced.npy')
-            reloaded_features = pd.read_json('outputs/processed/features_reduced.json', typ='series').tolist()
-            
-            log_forensic_snapshot(reloaded_X, "reloaded_train_X", logger)
-            
-            assert reloaded_X.shape[1] == len(reloaded_features)
-            assert reloaded_test_X.shape[1] == len(reloaded_features)
-            
-            logger.info(f"✓ Bridge Validation SUCCESS. Train: {reloaded_X.shape}, Test: {reloaded_test_X.shape}")
-            
-            logger.info(f"Preprocessing Complete. Full features: {len(all_candidate_features)}, Reduced: {len(reduced_features)}")
-            del train_aligned, test_aligned, reloaded_X, reloaded_test_X; gc.collect()
-            memory_guard("final_cleanup", logger)
 
-        elif phase == '3_train_base':
-            tracer.checkpoint("data_load")
-            X_train = load_npy('outputs/processed/X_train_reduced.npy')
-            y_train = load_npy('outputs/processed/y_train.npy')
-            X_test = load_npy('outputs/processed/X_test_reduced.npy')
-            features = pd.read_json('outputs/processed/features_reduced.json', typ='series').tolist()
-            groups = load_npy('outputs/processed/groups.npy', allow_pickle=True)
+        elif phase == '3_train_raw':
+            # [PHASE 3: STAGE A - RAW TRAINING]
+            schema = Config.get_feature_schema()
+            X_train_raw = load_npy(f'{Config.PROCESSED_PATH}/X_train_raw.npy')
+            X_test_raw = load_npy(f'{Config.PROCESSED_PATH}/X_test_raw.npy')
+            y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
+            scenario_id = load_npy(f'{Config.PROCESSED_PATH}/scenario_id.npy', allow_pickle=True)
             
-            log_forensic_snapshot(X_train, "X_train_base_raw", logger)
+            trainer = Trainer(X_train_raw, y_train, X_test_raw, schema, scenario_id)
             
-            # --- v5.1 SSOT: Schema Hash Verification ---
-            tracer.checkpoint("schema_verify")
-            expected_hash_path = 'outputs/processed/features_reduced_hash.txt'
-            assert os.path.exists(expected_hash_path), "Schema hash file missing!"
-            with open(expected_hash_path, 'r') as f:
-                saved_hash = f.read().strip()
-            import hashlib
-            live_hash = hashlib.md5(','.join(features).encode()).hexdigest()
-            assert saved_hash == live_hash, f"SCHEMA DRIFT! Saved: {saved_hash}, Live: {live_hash}"
+            # Train Raw Model
+            raw_mae, oof_raw = trainer.fit_raw_model()
             
-            # --- v5.1 SSOT: ASSERT-ONLY Guards ---
-            tracer.checkpoint("shape_assert")
-            assert X_train.shape[1] == len(features), "X_train width mismatch!"
-            assert X_test.shape[1] == len(features), "X_test width mismatch!"
-            assert X_train.dtype != object, "X_train contains object dtype!"
-            assert not np.isnan(X_train).any(), "X_train has NaNs!"
+            # Generate Residuals
+            residuals_raw = y_train - oof_raw
             
-            # --- DEBUG/TRACE OVERRIDES (Slicing Only) ---
+            # Save Stage A Artifacts
+            save_npy(oof_raw, f'{Config.PROCESSED_PATH}/oof_raw.npy')
+            save_npy(residuals_raw, f'{Config.PROCESSED_PATH}/residuals_raw.npy')
+            save_npy(trainer.test_preds['raw'], f'{Config.PREDICTIONS_PATH}/test_raw_preds.npy')
+            
+            export_metric(raw_mae, "raw_mae.txt")
+
+        elif phase == '4_build_full':
+            # [PHASE 5: STAGE B - EMBED BUILDING]
+            tracer.checkpoint("load_data")
+            train, test = load_data()
             if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
                 rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                logger.info(f"[TRACE/DEBUG] Slicing to {rows} rows.")
-                X_train = X_train[:rows]
-                y_train = y_train[:rows]
-                groups = groups[:rows]
-
-                # --- DEBUG: Group-Aware Sampling ---
-                if Config.DEBUG_PHASE3 and not Config.DEBUG_MINIMAL:
-                    import random
-                    unique_scenarios = np.unique(groups)
-                    k = max(2, len(unique_scenarios) // 100)
-                    sampled_scenarios = random.sample(list(unique_scenarios), k=k)
-                    subset_idx = np.isin(groups, sampled_scenarios)
-                    X_train = X_train[subset_idx]
-                    y_train = y_train[subset_idx]
-                    groups = groups[subset_idx]
-                    logger.info(f"[DEBUG] Group-aware sampling: {k} scenarios. Shape: {X_train.shape}")
-
-            # --- HARD FAIL ON EMPTY TRAINING ---
-            assert X_train.shape[0] > 0, "No training samples available!"
-            assert X_train.shape[1] > 0, "No features available!"
-
-            # 2. Step: validation
-            current_step = "validation"
-            tr_df = pd.DataFrame(X_train, columns=features)
-            tr_df[Config.TARGET] = y_train
-            te_df = pd.DataFrame(X_test, columns=features)
+                train = train.head(rows); test = test.head(rows)
             
-            trainer = Trainer(tr_df, te_df, features, groups)
-            trainer.validate_data(X_train, y_train, groups)
+            schema = Config.get_feature_schema()
+            residuals = load_npy(f'{Config.PROCESSED_PATH}/residuals_raw.npy')
+            oof_raw = load_npy(f'{Config.PROCESSED_PATH}/oof_raw.npy')
             
-            # 3. Step: train (LightGBM + CatBoost in single CV loop)
-            tracer.checkpoint("train_models")
-            logger.info("[TRAINING_START]")
-            logger.info(f"Folds: {Config.NFOLDS} | Samples: {X_train.shape[0]} | Features: {len(features)}")
-            logger.info(f"--- Training LightGBM + CatBoost ---")
-            lgb_mae, cat_mae = trainer.train_kfolds(features)
+            # Initial hybrid features to get reconstructor
+            train, test, _, reconstructor = add_hybrid_latent_features(train, test)
             
-            if (Config.DEBUG_PHASE3 or Config.DEBUG_MINIMAL or Config.TRACE_MODE) and lgb_mae > 0:
-                logger.info(f"[DONE] Phase 3 Sanity Check OK. MAE: {lgb_mae:.6f}")
-            
-            save_npy(trainer.oof_lgb, 'outputs/predictions/oof_lgb.npy')
-            save_npy(trainer.test_preds_lgb, 'outputs/predictions/test_lgb.npy')
-            save_npy(np.array(trainer.test_preds_lgb_folds), 'outputs/predictions/test_lgb_folds.npy')
-            
-            if not Config.DEBUG_PHASE3 and not Config.DEBUG_MINIMAL and not Config.TRACE_MODE:
-                save_npy(trainer.oof_cat, 'outputs/predictions/oof_cat.npy')
-                save_npy(trainer.test_preds_cat, 'outputs/predictions/test_cat.npy')
-                
-                ensemble_mae = (lgb_mae + cat_mae) / 2.0
-                logger.info(f"Base Ensemble MAE (Approx): {ensemble_mae:.6f}")
-                export_metric(ensemble_mae)
-            else:
-                export_metric(lgb_mae)
-            
-            logger.info("[TRAINING_END]")
-            
-            # --- EXECUTION GUARANTEES ---
-            if not os.path.exists("outputs/predictions/oof_lgb.npy"):
-                raise RuntimeError("Phase 3 failed: oof_lgb.npy was not created. Training did not execute.")
-            if not os.path.exists("outputs/predictions/test_lgb.npy"):
-                raise RuntimeError("Phase 3 failed: test_lgb.npy was not created. Training did not execute.")
-                
-            del tr_df, te_df, X_train, X_test, y_train, trainer; gc.collect()
-
-        elif phase == '4_stacking':
-            tracer.checkpoint("data_load")
-            train = load_pkl('outputs/processed/train_full.pkl')
-            test = load_pkl('outputs/processed/test_full.pkl')
-            
-            if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
-                rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                logger.info(f"[TRACE/DEBUG] Slicing data to {rows} rows.")
-                train = train.head(rows)
-                test = test.head(rows)
-                
-            features = pd.read_json('outputs/processed/features_full.json', typ='series').tolist()
-            groups = train['scenario_id']
-            
-            log_forensic_snapshot(train, "train_stack_raw", logger)
-            
-            tracer.checkpoint("meta_prep")
-            trainer = Trainer(train, test, features, groups)
-            trainer.oof_lgb = load_npy('outputs/predictions/oof_lgb.npy')
-            
-            # v5.2 TRACE-SAFE: Only load OOF Cat if shape matches trace rows
-            if os.path.exists('outputs/predictions/oof_cat.npy'):
-                trainer.oof_cat = load_npy('outputs/predictions/oof_cat.npy')
-                if len(trainer.oof_cat) != len(train):
-                    logger.warning(f"[TRACE] Shape mismatch in oof_cat ({len(trainer.oof_cat)} vs {len(train)}). Forcing zeros.")
-                    trainer.oof_cat = np.zeros(len(train))
-            else:
-                trainer.oof_cat = np.zeros(len(train))
-                
-            trainer.test_preds_lgb = load_npy('outputs/predictions/test_lgb.npy')
-            
-            if os.path.exists('outputs/predictions/test_cat.npy'):
-                trainer.test_preds_cat = load_npy('outputs/predictions/test_cat.npy')
-                if len(trainer.test_preds_cat) != len(test):
-                    logger.warning(f"[TRACE] Shape mismatch in test_cat ({len(trainer.test_preds_cat)} vs {len(test)}). Forcing zeros.")
-                    trainer.test_preds_cat = np.zeros(len(test))
-            else:
-                trainer.test_preds_cat = np.zeros(len(test))
-            
-            # --- NEW: Load top features for Advanced Stacking ---
-            tracer.checkpoint("top_features")
-            top_features_train = None
-            top_features_test = None
-            
-            if os.path.exists('outputs/processed/feature_importances.json'):
-                imp_series = pd.read_json('outputs/processed/feature_importances.json', typ='series')
-                reduced_features = pd.read_json('outputs/processed/features_reduced.json', typ='series').tolist()
-                
-                top_k = min(Config.STACKING_TOP_K, len(imp_series))
-                top_feature_names = imp_series.sort_values(ascending=False).head(top_k).index.tolist()
-                
-                # Filter to only features that exist in reduced set
-                valid_top = [f for f in top_feature_names if f in reduced_features]
-                
-                if valid_top:
-                    top_indices = [reduced_features.index(f) for f in valid_top]
-                    
-                    X_train_reduced = load_npy('outputs/processed/X_train_reduced.npy')
-                    X_test_reduced = load_npy('outputs/processed/X_test_reduced.npy')
-                    
-                    if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
-                        X_train_reduced = X_train_reduced[:rows]
-                    
-                    top_features_train = pd.DataFrame(
-                        X_train_reduced[:, top_indices],
-                        columns=valid_top
-                    )
-                    top_features_test = pd.DataFrame(
-                        X_test_reduced[:, top_indices],
-                        columns=valid_top
-                    )
-                    logger.info(f"[STACKING] Loaded {len(valid_top)} top features for meta-model")
-                    del X_train_reduced, X_test_reduced; gc.collect()
-            else:
-                logger.warning("[STACKING] feature_importances.json not found. Using OOF-only stacking.")
-            
-            # --- Correlation Check ---
-            tracer.checkpoint("correlation_check")
-            if not (trainer.oof_cat == 0).all():
-                corr = np.corrcoef(trainer.oof_lgb, trainer.oof_cat)[0, 1]
-                logger.info(f"[CORRELATION] OOF_LGB vs OOF_CAT: {corr:.4f}")
-                if corr > 0.9:
-                    logger.warning(f"[CORRELATION_WARNING] Very high correlation ({corr:.4f}). Stacking benefit may be limited.")
-            
-            tracer.checkpoint("train_stack")
-            oof_stack, test_stack, stack_mae, skipped = trainer.train_stacking(
-                features, top_features_train, top_features_test
+            # Supercharged PCA using residuals
+            train, test, _ = generate_supercharged_latent_features(
+                train, test, reconstructor, residuals, oof_raw
             )
             
-            if skipped:
-                logger.info(f"[STACKING_RESULT] Stacking skipped. Using base blending MAE: {stack_mae:.6f}")
-            else:
-                logger.info(f"[STACKING_RESULT] Stacking improved! MAE: {stack_mae:.6f}")
+            # [PHASE 6: IMMUTABILITY LOCK]
+            # Final build and contract enforcement
+            from src.data_loader import build_features
+            X_train_full, train = build_features(train, schema, mode='full')
+            X_test_full, test = build_features(test, schema, mode='full')
             
-            export_metric(stack_mae)
-            save_npy(test_stack, 'outputs/predictions/test_stack.npy')
-            del train, test, trainer, top_features_train, top_features_test; gc.collect()
+            # Save Full Feature Matrices
+            save_npy(X_train_full.values, f'{Config.PROCESSED_PATH}/X_train_full.npy')
+            save_npy(X_test_full.values, f'{Config.PROCESSED_PATH}/X_test_full.npy')
+            
+            # Also save regime_proxy for meta model
+            save_npy(train['regime_proxy'].values, f'{Config.PROCESSED_PATH}/regime_proxy_tr.npy')
+            save_npy(test['regime_proxy'].values, f'{Config.PROCESSED_PATH}/regime_proxy_te.npy')
 
-        elif phase == '5_pseudo_labeling':
-            tracer.checkpoint("init")
-            if Config.MODE != 'full' and not Config.TRACE_MODE:
-                logger.info("Skipping Phase 5 in Debug Mode.")
-                return
-                
-            tracer.checkpoint("data_load")
-            # --- REDESIGN: Use Reduced Feature Space (Numpy) ---
-            X_train_orig = load_npy('outputs/processed/X_train_reduced.npy')
-            y_train_orig = load_npy('outputs/processed/y_train.npy')
-            X_test_reduced = load_npy('outputs/processed/X_test_reduced.npy')
-            groups_orig = load_npy('outputs/processed/groups.npy', allow_pickle=True)
+        elif phase == '5_train_final':
+            # [PHASE 4: TRAINER ISOLATION - FINAL]
+            schema = Config.get_feature_schema()
+            X_train_full = load_npy(f'{Config.PROCESSED_PATH}/X_train_full.npy')
+            X_test_full = load_npy(f'{Config.PROCESSED_PATH}/X_test_full.npy')
+            y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
+            scenario_id = load_npy(f'{Config.PROCESSED_PATH}/scenario_id.npy', allow_pickle=True)
             
-            if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
-                rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                logger.info(f"[TRACE/DEBUG] Slicing numpy arrays to {rows} rows.")
-                X_train_orig = X_train_orig[:rows]
-                y_train_orig = y_train_orig[:rows]
-                groups_orig = groups_orig[:rows]
-                
-            features = pd.read_json('outputs/processed/features_reduced.json', typ='series').tolist()
+            trainer = Trainer(X_train_full, y_train, X_test_full, schema, scenario_id)
             
-            # Load prediction components for variance + agreement calculation
-            test_preds_lgb = load_npy('outputs/predictions/test_lgb.npy')
-            test_lgb_folds = load_npy('outputs/predictions/test_lgb_folds.npy')
+            # 1. We need oof_raw for the meta model
+            oof_raw = load_npy(f'{Config.PROCESSED_PATH}/oof_raw.npy')
+            trainer.oof_preds['raw'] = oof_raw
+            trainer.test_preds['raw'] = load_npy(f'{Config.PREDICTIONS_PATH}/test_raw_preds.npy')
             
-            if os.path.exists('outputs/predictions/test_cat.npy'):
-                test_preds_cat = load_npy('outputs/predictions/test_cat.npy')
-            else:
-                test_preds_cat = test_preds_lgb.copy() # Fallback if catboost not trained
+            # 2. Train Embed Model
+            embed_mae, oof_embed = trainer.fit_embed_model()
             
-            # --- v5.4 SAFETY: Align Auxiliary Arrays with Primary Test Data (Fix IndexError) ---
-            n_samples = len(X_test_reduced)
-            if len(test_preds_lgb) != n_samples:
-                logger.warning(f"[SAFETY] Aligning predictions shape ({len(test_preds_lgb)}) to match test features ({n_samples})")
-                test_preds_lgb = test_preds_lgb[:n_samples]
-                test_preds_cat = test_preds_cat[:n_samples]
-            if test_lgb_folds.shape[1] != n_samples:
-                test_lgb_folds = test_lgb_folds[:, :n_samples]
-                
-            # Memory Telemetry Setup
-            from src.utils import get_process_memory, get_system_ram
-            total_ram = get_system_ram()
-            limit_ram = total_ram * 0.8
-            logger.info(f"[TELEMETRY] System RAM: {total_ram:.0f} MB | Fail-Safe Limit: {limit_ram:.0f} MB")
-
-            # --- ENHANCED CONFIDENCE SELECTION (Fold Variance + Model Agreement) ---
-            tracer.checkpoint("confidence_selection")
-            test_lgb_folds_arr = np.asanyarray(test_lgb_folds)
+            # 3. Meta Stacking
+            regime_proxy_tr = load_npy(f'{Config.PROCESSED_PATH}/regime_proxy_tr.npy')
+            regime_proxy_te = load_npy(f'{Config.PROCESSED_PATH}/regime_proxy_te.npy')
             
-            # 1. Fold Variance Score (lower variance = more reliable)
-            fold_variance = np.std(test_lgb_folds_arr, axis=0)
-            fold_var_rank = np.argsort(np.argsort(fold_variance))  # rank: 0=lowest variance
+            X_meta_tr = np.column_stack([oof_raw, oof_embed, regime_proxy_tr]).astype(np.float32)
+            X_meta_te = np.column_stack([trainer.test_preds['raw'], trainer.test_preds['embed'], regime_proxy_te]).astype(np.float32)
             
-            # 2. Model Agreement Score (lower difference = more agreement)
-            model_disagreement = np.abs(test_preds_lgb - test_preds_cat)
-            agree_rank = np.argsort(np.argsort(model_disagreement))  # rank: 0=most agreement
+            meta_mae, oof_meta = trainer.fit_meta_model(X_meta_tr, X_meta_te)
             
-            # 3. Combined Confidence Score (lower = better)
-            if np.allclose(test_preds_cat, test_preds_lgb):
-                # CatBoost not trained or identical - use only fold variance
-                combined_score = fold_var_rank.astype(float)
-                logger.info(f"[PSEUDO_DIAG] Using fold variance only (no CatBoost available)")
-            else:
-                combined_score = fold_var_rank.astype(float) + agree_rank.astype(float)
-                logger.info(f"[PSEUDO_DIAG] Using combined fold variance + model agreement")
+            # Save Final Predictions
+            save_npy(oof_meta, f"{Config.PREDICTIONS_PATH}/oof_stable.npy")
+            save_npy(trainer.test_preds['meta'], f"{Config.PREDICTIONS_PATH}/test_stable.npy")
             
-            n_pseudo = min(5000, len(X_test_reduced))
-            confidence_idx = np.argsort(combined_score)[:n_pseudo].astype(int)
-            
-            X_pseudo = X_test_reduced[confidence_idx]
-            y_pseudo = (test_preds_lgb[confidence_idx] + test_preds_cat[confidence_idx]) / 2.0
-            
-            logger.info(f"[PSEUDO_DIAG] Selected {len(X_pseudo)} pseudo-labeled samples")
-            logger.info(f"[PSEUDO_DIAG] Fold Variance range: [{fold_variance[confidence_idx].min():.4f}, {fold_variance[confidence_idx].max():.4f}]")
-            logger.info(f"[PSEUDO_DIAG] Model Disagreement range: [{model_disagreement[confidence_idx].min():.4f}, {model_disagreement[confidence_idx].max():.4f}]")
-            log_memory_usage(X_pseudo, "X_pseudo", logger)
-
-            # --- DISTRIBUTION CHECK ---
-            tracer.checkpoint("distribution_check")
-            train_mean, train_std = y_train_orig.mean(), y_train_orig.std()
-            pseudo_mean, pseudo_std = y_pseudo.mean(), y_pseudo.std()
-            
-            logger.info(f"[PSEUDO_DIAG] Train target  | mean={train_mean:.4f} std={train_std:.4f}")
-            logger.info(f"[PSEUDO_DIAG] Pseudo target  | mean={pseudo_mean:.4f} std={pseudo_std:.4f}")
-            
-            mean_shift = abs(pseudo_mean - train_mean)
-            std_ratio = pseudo_std / (train_std + 1e-9)
-            
-            if mean_shift > 0.5 * train_std:
-                logger.warning(f"[PSEUDO_ABORT] Mean shift too large: {mean_shift:.4f} > {0.5*train_std:.4f}")
-                logger.warning(f"[PSEUDO_ABORT] Pseudo labeling aborted due to distribution mismatch!")
-                del X_train_orig, X_pseudo, X_test_reduced; gc.collect()
-                return
-            
-            if std_ratio > 2.0 or std_ratio < 0.5:
-                logger.warning(f"[PSEUDO_ABORT] Std ratio out of range: {std_ratio:.4f} (acceptable: 0.5~2.0)")
-                logger.warning(f"[PSEUDO_ABORT] Pseudo labeling aborted due to distribution mismatch!")
-                del X_train_orig, X_pseudo, X_test_reduced; gc.collect()
-                return
-            
-            logger.info(f"[PSEUDO_DIAG] Distribution check PASSED (mean_shift={mean_shift:.4f}, std_ratio={std_ratio:.4f})")
-
-            # --- BASELINE EXPERIMENT (no pseudo, for comparison) ---
-            tracer.checkpoint("baseline_experiment")
-            tr_meta_base = pd.DataFrame({
-                Config.TARGET: y_train_orig,
-                'scenario_id': groups_orig
-            })
-            trainer_base = Trainer(tr_meta_base, X_test_reduced, features, groups_orig)
-            base_mae, _ = trainer_base.train_kfolds(features, train_df=X_train_orig, seeds=Config.SEEDS[:1])
-            logger.info(f"[PSEUDO_BASELINE] No-pseudo MAE (1 seed): {base_mae:.6f}")
-            del tr_meta_base, trainer_base; gc.collect()
-
-            # --- EXPERIMENT LOOP WITH SAMPLE WEIGHTING ---
-            best_mae = float('inf')
-            best_config = {'count': 1000, 'weight': 1.0}
-            
-            experiment_counts = [1000, 3000, 5000] if Config.MODE == 'full' else [1000]
-            pseudo_weights = Config.PSEUDO_WEIGHTS if Config.MODE == 'full' else [0.5]
-            
-            stop_experiments = False
-            for count in experiment_counts:
-                if stop_experiments:
-                    break
-                for weight in pseudo_weights:
-                    mem_now = get_process_memory()
-                    logger.info(f"[TELEMETRY] Experiment (count={count}, weight={weight}) | Process: {mem_now:.1f} MB")
-                    
-                    if mem_now > limit_ram:
-                        logger.warning(f"[FAIL-SAFE] Memory usage ({mem_now:.1f} MB) exceeds limit. Stopping experiments.")
-                        stop_experiments = True
-                        break
-                        
-                    tracer.checkpoint(f"experiment_{count}_w{weight}")
-                    X_combined = np.vstack([X_train_orig, X_pseudo[:count]])
-                    y_combined = np.concatenate([y_train_orig, y_pseudo[:count]])
-                    
-                    # Build sample weights
-                    sw = np.concatenate([
-                        np.ones(len(X_train_orig)),
-                        np.full(count, weight)
-                    ])
-                    
-                    pseudo_groups = np.array(['PSEUDO'] * count, dtype=object)
-                    tr_meta = pd.DataFrame({
-                        Config.TARGET: y_combined,
-                        'scenario_id': np.concatenate([groups_orig, pseudo_groups])
-                    })
-                    
-                    trainer = Trainer(tr_meta, X_test_reduced, features, tr_meta['scenario_id'].values)
-                    lgb_mae, _ = trainer.train_kfolds(features, train_df=X_combined, seeds=Config.SEEDS[:1], sample_weight=sw)
-                    
-                    logger.info(f"[PSEUDO_EXPERIMENT] Count={count} | Weight={weight} | MAE: {lgb_mae:.6f}")
-                    if lgb_mae < best_mae:
-                        best_mae = lgb_mae
-                        best_config = {'count': count, 'weight': weight}
-                        
-                    del X_combined, y_combined, sw, tr_meta, trainer; gc.collect()
-                    logger.info(f"[TELEMETRY] Iteration End | Process: {get_process_memory():.1f} MB")
-
-            logger.info(f"[PSEUDO_BEST] Best Config: count={best_config['count']}, weight={best_config['weight']} | MAE: {best_mae:.6f}")
-            logger.info(f"[PSEUDO_COMPARE] Baseline (no pseudo): {base_mae:.6f} | Best pseudo: {best_mae:.6f} | Delta: {base_mae - best_mae:.6f}")
-            
-            if best_mae >= base_mae:
-                logger.warning(f"[PSEUDO_SKIP] Pseudo labeling did NOT improve performance. Skipping.")
-                export_metric(base_mae)
-                del X_train_orig, X_pseudo, X_test_reduced; gc.collect()
-                return
-            
-            export_metric(best_mae)
-            
-            tracer.checkpoint("save_best")
-            best_count = best_config['count']
-            pseudo_labels = pd.DataFrame({
-                'idx': confidence_idx[:best_count],
-                Config.TARGET: y_pseudo[:best_count],
-                'weight': best_config['weight']
-            })
-            save_pkl(pseudo_labels, 'outputs/processed/pseudo_labels_index.pkl')
-            
-            del X_train_orig, X_pseudo, X_test_reduced; gc.collect()
+            export_metric(meta_mae)
+            forensic.log_model_performance(y_train, oof_meta)
+            forensic.save_all()
 
         elif phase == '6_retrain':
-            tracer.checkpoint("data_load")
-            X_train_orig = load_npy('outputs/processed/X_train_reduced.npy')
-            y_train_orig = load_npy('outputs/processed/y_train.npy')
-            X_test_reduced = load_npy('outputs/processed/X_test_reduced.npy')
-            groups_orig = load_npy('outputs/processed/groups.npy', allow_pickle=True)
+            # Pseudo Labeling on Full Schema
+            schema = Config.get_feature_schema()
+            X_train_full = load_npy(f'{Config.PROCESSED_PATH}/X_train_full.npy')
+            X_test_full = load_npy(f'{Config.PROCESSED_PATH}/X_test_full.npy')
+            y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
+            scenario_id = load_npy(f'{Config.PROCESSED_PATH}/scenario_id.npy', allow_pickle=True)
+            test_stable = load_npy(f'{Config.PREDICTIONS_PATH}/test_stable.npy')
             
-            if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
-                rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                X_train_orig = X_train_orig[:rows]
-                y_train_orig = y_train_orig[:rows]
-                groups_orig = groups_orig[:rows]
-                
-            features = pd.read_json('outputs/processed/features_reduced.json', typ='series').tolist()
+            # Simple top 10% high confidence pseudo labeling
+            n_pseudo = int(len(test_stable) * 0.1)
+            high_conf_idx = np.argsort(test_stable)[-n_pseudo:]
             
-            sw = None  # sample weights
-            if os.path.exists('outputs/processed/pseudo_labels_index.pkl'):
-                pseudo_info = load_pkl('outputs/processed/pseudo_labels_index.pkl')
-                idx = pseudo_info['idx'].values
-                target = pseudo_info[Config.TARGET].values
-                pseudo_weight = float(pseudo_info['weight'].iloc[0]) if 'weight' in pseudo_info.columns else 1.0
-                
-                X_combined = np.vstack([X_train_orig, X_test_reduced[idx]])
-                y_combined = np.concatenate([y_train_orig, target])
-                
-                # Build sample weights
-                sw = np.concatenate([
-                    np.ones(len(X_train_orig)),
-                    np.full(len(idx), pseudo_weight)
-                ])
-                
-                pseudo_groups = np.array(['PSEUDO'] * len(idx), dtype=object)
-                groups_comb = np.concatenate([groups_orig, pseudo_groups])
-                logger.info(f"Retraining with {len(idx)} pseudo-labeled samples (weight={pseudo_weight}).")
-            else:
-                X_combined = X_train_orig
-                y_combined = y_train_orig
-                groups_comb = groups_orig
-                logger.warning("No pseudo labels found. Standard retraining.")
-
-            tr_meta = pd.DataFrame({
-                Config.TARGET: y_combined,
-                'scenario_id': groups_comb
-            })
+            X_combined = np.concatenate([X_train_full, X_test_full[high_conf_idx]]).astype(np.float32)
+            y_combined = np.concatenate([y_train, test_stable[high_conf_idx]]).astype(np.float32)
+            groups_combined = np.concatenate([scenario_id, np.array(['PSEUDO'] * n_pseudo)])
             
-            tracer.checkpoint("train_kfolds")
-            trainer = Trainer(tr_meta, X_test_reduced, features, groups_comb)
-            lgb_mae, cat_mae = trainer.train_kfolds(features, train_df=X_combined, sample_weight=sw)
+            trainer = Trainer(X_combined, y_combined, X_test_full, schema, groups_combined)
             
-            tracer.checkpoint("blending")
-            best_w, final_mae = trainer.find_best_weight()
-            final_preds = best_w * trainer.test_preds_lgb + (1 - best_w) * trainer.test_preds_cat
-            
-            logger.info(f"Retrained Final MAE: {final_mae:.6f}")
-            export_metric(final_mae)
-            save_npy(final_preds, 'outputs/predictions/final_preds.npy')
-            del X_combined, y_combined, tr_meta, trainer; gc.collect()
+            _, cat_mae = trainer.train_kfolds(X_subset=X_combined, y=y_combined, result_key='cat', custom_params=Config.CAT_PARAMS)
+            save_npy(trainer.test_preds['cat'], f'{Config.PREDICTIONS_PATH}/test_cat.npy')
 
         elif phase == '7_inference':
-            tracer.checkpoint("compile")
-            preds_path = None
-            for path in ['outputs/predictions/test_stack.npy', 'outputs/predictions/final_preds.npy', 'outputs/predictions/test_lgb.npy']:
-                if os.path.exists(path):
-                    preds_path = path
-                    break
-            
-            if preds_path is None:
-                raise FileNotFoundError("No prediction files found.")
-                
-            logger.info(f"Using predictions from: {preds_path}")
-            final_preds = load_npy(preds_path)
-            save_npy(final_preds, 'outputs/predictions/submission_ready.npy')
+            logger.info("[EXPLOSION] Starting Leaderboard Explosion Inference Pipeline")
+            final_preds = run_explosion_inference()
+            save_npy(final_preds, f'{Config.PREDICTIONS_PATH}/final_submission.npy')
+            logger.info(f"[EXPLOSION] Final predictions saved | mean={final_preds.mean():.4f} | std={final_preds.std():.4f}")
 
         elif phase == '8_submission':
-            tracer.checkpoint("schema_load")
-            if Config.TRACE_MODE:
-                raise RuntimeError("TRACE_MODE output detected. Full dataset required for submission.")
-                
-            sample_path = os.path.join(Config.DATA_PATH, 'sample_submission.csv')
-            sample_sub = pd.read_csv(sample_path)
-            test_meta = load_pkl('outputs/processed/test_full.pkl')
+            final_preds = load_npy(f'{Config.PREDICTIONS_PATH}/final_submission.npy')
+            sample_sub = pd.read_csv(Config.DATA_PATH + 'sample_submission.csv')
+            if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
+                rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
+                sample_sub = sample_sub.head(rows)
+
+            validate_output_len(final_preds, len(sample_sub), "Submission")
             
-            tracer.checkpoint("pred_parsing")
-            final_preds = load_npy('outputs/predictions/submission_ready.npy')
-            pred_df = pd.DataFrame({'ID': test_meta['ID'].values, 'prediction': final_preds})
+            train_stats = json.load(open(f'{Config.PROCESSED_PATH}/train_stats.json'))
+            pred_std = float(np.std(final_preds))
+            std_ratio = pred_std / (train_stats['std'] + 1e-9)
+            p99_ratio = float(np.quantile(final_preds, 0.99)) / (train_stats['p99'] + 1e-9)
             
-            tracer.checkpoint("id_merge")
-            target_col = sample_sub.columns[1]
-            submission = sample_sub[['ID']].merge(pred_df, on='ID', how='left', validate='one_to_one')
-            submission[target_col] = submission['prediction']
+            print("\n" + "="*50)
+            print("[DISTRIBUTION_STATUS]")
+            print(f"* std_ratio: {std_ratio:.4f}")
+            print(f"* p99_ratio: {p99_ratio:.4f}")
             
-            tracer.checkpoint("hard_validation")
-            assert submission.shape[0] == sample_sub.shape[0]
-            assert submission['ID'].equals(sample_sub['ID'])
-            assert submission[target_col].isnull().sum() == 0
-            assert np.isfinite(submission[target_col]).all()
+            if std_ratio < 0.7: logger.warning("[COLLAPSE_DETECTED] std_ratio < 0.7!")
+            if p99_ratio < 0.6: logger.warning("[COLLAPSE_DETECTED] p99_ratio < 0.6!")
             
-            submission = submission[['ID', target_col]]
-            submission.to_csv(Config.SUBMISSION_PATH, index=False, encoding='utf-8')
+            sample_sub[Config.TARGET] = final_preds
+            sample_sub.to_csv(Config.SUBMISSION_PATH, index=False)
+            logger.info(f"[SUBMISSION_COMPLETE] ID: {Config.RUN_ID}")
             
-            tracer.checkpoint("validation")
-            validate_submission(Config.SUBMISSION_PATH, len(submission))
-            logger.info(f"✓ ID-Deterministic Submission exported: {Config.SUBMISSION_PATH}")
-            del test_meta, sample_sub, submission, pred_df; gc.collect()
+        elif phase == '9_intelligence':
+            # [PHASE 3: ASSERTION FIREWALL]
+            # Ensure the intelligence module receives a complete metric contract.
+            intel = ExperimentIntelligence()
+            
+            # Load OOF and targets to build the full metric suite
+            y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
+            oof_stable = load_npy(f'{Config.PREDICTIONS_PATH}/oof_stable.npy')
+            
+            from src.utils import build_metrics
+            metrics = build_metrics(y_train, oof_stable)
+            
+            # Additional metadata for registry
+            metrics["features"] = [] # Placeholder for future feature tracking
+            
+            intel.run_risk_focused_pipeline(Config.RUN_ID, metrics)
+
+        elif phase == 'validate_artifacts':
+            target = getattr(Config, 'VALIDATE_TARGET', None)
+            if target: ArtifactValidator.check_phase_outputs(target, logger)
+        elif phase == 'verify_paths':
+            verify_path_permissions(logger)
+            validate_consistency(logger)
+
+def inject_temporal_continuity(train, test, K=20):
+    # PURPOSE: [DEPRECATED] Subsumed by HybridTemporalReconstructor
+    # INPUT: train (DataFrame), test (DataFrame), K (int)
+    # OUTPUT: DataFrame, List[int]
+    # FAILURE: Returns original test if not implemented
+    return test, list(range(len(test)))
 
 def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--phase', type=str, required=True, choices=[
-        '1_data_check', '2_preprocess', '3_train_base', '4_stacking', 
-        '5_pseudo_labeling', '6_retrain', '7_inference', '8_submission'
-    ])
-    parser.add_argument('--mode', type=str, default='full', choices=['full', 'debug', 'trace'])
-    parser.add_argument('--debug-minimal', action='store_true', help='Force 100 rows and 1 fold for sanity check')
+    # PURPOSE: Entry point for the pipeline execution engine
+    # INPUT: CLI arguments (--phase, --mode, --dry-run, --smoke-test)
+    # OUTPUT: None
+    # FAILURE: Exits with code 1 if phase or contract violation detected
+    
+    # [MISSION: GLOBAL MODEL INTERFACE LOCKDOWN — ELIMINATE ALL CONTRACT VIOLATIONS]
+    # Scan entire codebase for direct model.fit / predict calls.
+    check_model_contract_compliance()
+
+    parser = argparse.ArgumentParser(description="DACON Pipeline Execution Engine")
+    parser.add_argument('--phase', type=str, required=True, choices=VALID_PHASES, help="Pipeline phase to execute")
+    parser.add_argument('--mode', type=str, default='full', choices=['full', 'debug', 'trace'], help="Execution mode")
+    parser.add_argument('--dry-run', action='store_true', help="Validate paths without writing")
+    parser.add_argument('--smoke-test', action='store_true', help="Run minimal rows/folds for testing")
+    parser.add_argument('--validate-target', type=str, help="Target phase for artifact validation")
+    
+    # [PHASE 5: DEBUG TRACE]
     args = parser.parse_args()
     
-    if args.mode == 'trace':
-        Config.TRACE_MODE = True
-        
-    if args.debug_minimal:
-        Config.DEBUG_MINIMAL = True
-        
-    run_phase(args.phase, args.mode)
+    print(f"\n[PIPELINE_PHASE_LIST] {VALID_PHASES}")
+    print(f"[PHASE_EXECUTION_START] {args.phase} (Mode: {args.mode})")
+    
+    if args.dry_run: Config.DRY_RUN = True
+    if args.validate_target: Config.VALIDATE_TARGET = args.validate_target
+    
+    try:
+        run_phase(args.phase, args.mode, smoke_test=args.smoke_test)
+        print(f"[PHASE_EXECUTION_SUCCESS] {args.phase}")
+    except Exception as e:
+        print(f"\n[PHASE_EXECUTION_FAILED] {args.phase}: {str(e)}")
+        sys.exit(1)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__": main()

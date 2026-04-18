@@ -1,139 +1,98 @@
 #!/bin/bash
 
-# Configuration
-MODE="full"
-if [ "$1" == "debug" ]; then
-    MODE="debug"
-elif [ "$1" == "trace" ]; then
-    MODE="trace"
+# ==============================================================================
+# [PIPELINE: SINGLE-SOURCE-OF-TRUTH ARCHITECTURE]
+#
+# Philosophy: "Run once, wake up to submission.csv"
+# Execution: ./pipeline.sh [--debug]
+# ==============================================================================
+
+set -euo pipefail
+
+DEBUG_MODE=${1:-""}
+if [ "$DEBUG_MODE" = "--debug" ]; then
+    PYTHON_MODE="debug"
+    echo "[DEBUG MODE] Activated"
+else
+    PYTHON_MODE="full"
+    echo "[FULL MODE] Activated"
 fi
 
-HALT_ON_REGRESSION=false
-MAX_RETRIES=2
-LOG_DIR="logs"
-DONE_DIR=".done"
-PIPELINE_LOG="$LOG_DIR/pipeline.log"
-ERROR_LOG="$LOG_DIR/error.log"
-BEST_MAE_FILE="$LOG_DIR/best_mae.txt"
-
-# Clean Mode
-if [ "$1" == "clean" ]; then
-    echo "[CLEAN] Resetting pipeline artifacts..."
-    rm -rf "$LOG_DIR" "$DONE_DIR" "outputs/"
-    echo "Done."
-    exit 0
+SMOKE_FLAG=""
+if [ "${2:-""}" = "--smoke-test" ] || [ "${1:-""}" = "--smoke-test" ]; then
+    SMOKE_FLAG="--smoke-test"
+    echo "[SMOKE TEST MODE] Activated"
 fi
 
-# Initialization
-mkdir -p "$LOG_DIR" "$DONE_DIR" "outputs/processed" "outputs/models" "outputs/predictions"
+run_pipeline() {
+    export RUN_ID="run_$(date +%Y%m%d_%H%M%S)"
+    LOG_DIR="logs/$RUN_ID"
+    PIPELINE_LOG="$LOG_DIR/pipeline.log"
+    mkdir -p "$LOG_DIR"
 
-# Log Header
-echo "============================================" | tee -a "$PIPELINE_LOG"
-echo " PIPELINE EXECUTION START: $(date)" | tee -a "$PIPELINE_LOG"
-echo " MODE: $MODE" | tee -a "$PIPELINE_LOG"
-echo "============================================" | tee -a "$PIPELINE_LOG"
+    echo "[PRE-CLEAN] Starting..." | tee -a "$PIPELINE_LOG"
+    rm -rf logs/latest .done/latest 2>/dev/null || true
+    echo "[PRE-CLEAN] Complete." | tee -a "$PIPELINE_LOG"
 
-# Initial Best MAE (high value)
-if [ ! -f "$BEST_MAE_FILE" ]; then
-    echo "999.999" > "$BEST_MAE_FILE"
-fi
+    echo "============================================================" | tee -a "$PIPELINE_LOG"
+    echo "  DACON SUBMISSION PIPELINE - [RUN_ID: $RUN_ID]" | tee -a "$PIPELINE_LOG"
+    echo "  Start Time: $(date)" | tee -a "$PIPELINE_LOG"
+    echo "============================================================" | tee -a "$PIPELINE_LOG"
 
-# Trap for critical errors
-trap 'echo "[CRITICAL] Pipeline failed unexpectedly. See $ERROR_LOG." | tee -a "$PIPELINE_LOG"' ERR
-
-check_performance() {
-    local phase=$1
-    local current_mae_file="$LOG_DIR/current_mae.txt"
+    # [PHASE 2: PIPELINE AUTO-SYNC]
+    # Fetch valid phases directly from main.py (Single Source of Truth)
+    echo "[PIPELINE_SYNC] Fetching phase list from main.py..." | tee -a "$PIPELINE_LOG"
     
-    if [ ! -f "$current_mae_file" ]; then
-        return 0
-    fi
-    
-    current_mae=$(cat "$current_mae_file")
-    best_mae=$(cat "$BEST_MAE_FILE")
-    
-    # Use awk for robust float comparison
-    is_better=$(awk -v c="$current_mae" -v b="$best_mae" 'BEGIN {print (c < b)}')
-    
-    if [ "$is_better" -eq 1 ]; then
-        echo "[METRIC] Phase $phase Improved MAE: $best_mae -> $current_mae" | tee -a "$PIPELINE_LOG"
-        echo "$current_mae" > "$BEST_MAE_FILE"
-    else
-        echo "[WARNING] Performance Regression in $phase! Current: $current_mae, Best: $best_mae" | tee -a "$PIPELINE_LOG"
-        if [ "$HALT_ON_REGRESSION" = "true" ]; then
-            echo "[ERROR] Halting due to regression policy." | tee -a "$PIPELINE_LOG"
-            return 1
-        fi
-    fi
-    return 0
-}
+    # We only execute phases that are part of the main sequential graph (start with a number)
+    PHASES_STR=$(python -c "from main import VALID_PHASES; print(' '.join([p for p in VALID_PHASES if p[0].isdigit()]))")
+    read -a PHASES <<< "$PHASES_STR"
 
-run_phase() {
-    local phase=$1
-    local done_marker="$DONE_DIR/$phase.done"
-    local phase_log="$LOG_DIR/$phase.log"
-    local attempt=1
-    local delays=(0 10 30 0) # Added 0 for 3rd attempt log safety
-
-    if [ -f "$done_marker" ]; then
-        echo "[SKIP] Phase $phase already completed." | tee -a "$PIPELINE_LOG"
-        return 0
+    if [ ${#PHASES[@]} -eq 0 ]; then
+        echo "[FATAL] Failed to sync phases from main.py or list is empty." | tee -a "$PIPELINE_LOG"
+        exit 1
     fi
 
-    echo "[START] Phase: $phase" | tee -a "$PIPELINE_LOG"
-    start_time=$(date +%s)
+    echo "[PIPELINE_PHASE_LIST] ${PHASES[*]}" | tee -a "$PIPELINE_LOG"
 
-    while [ $attempt -le $((MAX_RETRIES + 1)) ]; do
-        echo "Attempt $attempt starting at $(date)..." >> "$phase_log"
-        if python main.py --phase "$phase" --mode "$MODE" >> "$phase_log" 2>&1; then
-            end_time=$(date +%s)
-            duration=$((end_time - start_time))
-            echo "[END] Phase $phase | Duration: ${duration}s" | tee -a "$PIPELINE_LOG"
-            touch "$done_marker"
-            
-            # Performance Fail-safe
-            if ! check_performance "$phase"; then
-                return 1
-            fi
-            return 0
+    for phase in "${PHASES[@]}"; do
+        # [PHASE 3: HARD VALIDATION LAYER]
+        # Although synced, we double-check against a validation script if necessary
+        # but here the sync itself provides the valid list.
+
+        echo "------------------------------------------------------------" | tee -a "$PIPELINE_LOG"
+        echo "[PHASE_EXECUTION_START] $phase" | tee -a "$PIPELINE_LOG"
+        start_ts=$(date +%s)
+        phase_log="$LOG_DIR/$phase.log"
+
+        if python main.py --phase "$phase" --mode "$PYTHON_MODE" $SMOKE_FLAG >> "$phase_log" 2>&1; then
+            end_ts=$(date +%s)
+            duration=$((end_ts - start_ts))
+            echo "[PHASE_EXECUTION_SUCCESS] $phase (${duration}s)" | tee -a "$PIPELINE_LOG"
         else
-            echo "[RETRY] Phase $phase failed (Attempt $attempt). Waiting ${delays[$attempt]}s..." | tee -a "$PIPELINE_LOG"
-            if [ $attempt -le $MAX_RETRIES ]; then
-                sleep ${delays[$attempt]}
-            fi
-            ((attempt++))
+            echo "[PHASE_EXECUTION_FAILED] $phase" | tee -a "$PIPELINE_LOG"
+            echo "------------------------------------------------------------" | tee -a "$PIPELINE_LOG"
+            echo "LAST 20 LINES OF $phase.log:" | tee -a "$PIPELINE_LOG"
+            tail -n 20 "$phase_log" | tee -a "$PIPELINE_LOG"
+            echo "------------------------------------------------------------" | tee -a "$PIPELINE_LOG"
+            exit 1
         fi
     done
 
-    echo "[FAIL] Phase $phase failed after $((attempt-1)) retries." | tee -a "$PIPELINE_LOG"
-    echo "--- Last 20 lines of $phase_log ---" >> "$ERROR_LOG"
-    tail -n 20 "$phase_log" >> "$ERROR_LOG"
-    echo "-----------------------------------" >> "$ERROR_LOG"
-    return 1
+    SUBMISSION_PATH="./outputs/$RUN_ID/submission.csv"
+    INTELLIGENCE_PATH="./outputs/$RUN_ID/processed/retrain_diagnostics.json"
+
+    BEST_SCORE="N/A"
+    if [ -f "$INTELLIGENCE_PATH" ]; then
+        BEST_SCORE=$(grep -oP '"overall_mae": \K[0-9.]+' "$INTELLIGENCE_PATH" | head -1 || echo "N/A")
+    fi
+
+    echo "============================================================" | tee -a "$PIPELINE_LOG"
+    echo "  [PIPELINE SUCCESS]" | tee -a "$PIPELINE_LOG"
+    echo "  RUN_ID: $RUN_ID" | tee -a "$PIPELINE_LOG"
+    echo "  BEST SCORE (MAE): $BEST_SCORE" | tee -a "$PIPELINE_LOG"
+    echo "  SUBMISSION: $SUBMISSION_PATH" | tee -a "$PIPELINE_LOG"
+    echo "  Finish Time: $(date)" | tee -a "$PIPELINE_LOG"
+    echo "============================================================" | tee -a "$PIPELINE_LOG"
 }
 
-# Main Phase Loop
-PHASES=(
-    "1_data_check"
-    "2_preprocess"
-    "3_train_base"
-    "4_stacking"
-    "5_pseudo_labeling"
-    "6_retrain"
-    "7_inference"
-    "8_submission"
-)
-
-for phase in "${PHASES[@]}"; do
-    if ! run_phase "$phase"; then
-        echo "[CRIT] Pipeline stopped at phase $phase" | tee -a "$PIPELINE_LOG"
-        exit 1
-    fi
-done
-
-# Final Summary
-echo "============================================" | tee -a "$PIPELINE_LOG"
-echo " PIPELINE COMPLETE: $(date)" | tee -a "$PIPELINE_LOG"
-echo " FINAL BEST MAE: $(cat "$BEST_MAE_FILE")" | tee -a "$PIPELINE_LOG"
-echo " SUBMISSION: outputs/submission.csv" | tee -a "$PIPELINE_LOG"
-echo "============================================" | tee -a "$PIPELINE_LOG"
+run_pipeline

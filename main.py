@@ -648,6 +648,8 @@ def run_phase(phase, mode, smoke_test=False):
             # [DATA_FLOW_AUDIT]
             logger.info(f"[DATA_FLOW_AUDIT] Phase 6:\n  * len(X): {len(X_combined)}\n  * len(y): {len(y_combined)}\n  * len(oof): {len(oof_cat)}")
             
+            # Save OOF and Test Predictions (Slicing OOF to match original train length)
+            save_npy(oof_cat[:len(y_train)], f'{Config.PREDICTIONS_PATH}/oof_cat.npy')
             save_npy(trainer.test_preds['cat'], f'{Config.PREDICTIONS_PATH}/test_cat.npy')
             
             # [SSOT: METRICS.JSON]

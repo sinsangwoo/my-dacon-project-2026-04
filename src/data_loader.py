@@ -265,12 +265,17 @@ def _rolling_slope(values):
 def build_features(df, schema, mode='raw', reconstructor=None, residuals=None, raw_preds=None, train_pool=None):
     """
     Single entry point for all feature engineering.
-    Ensures absolute feature contract enforcement.
+    Ensures absolute feature contract enforcement and GLOBAL ORDER IMMUTABILITY.
     """
     logger.info(f"[FEATURE_BUILD] Mode: {mode} | Schema Features: {len(schema['all_features'])}")
     
-    # 1. Base Preprocessing & Sort
+    # [RULE 1 & 2: ORDER IMMUTABILITY & SORT ISOLATION]
+    # 0. Capture original identity and order (Deep Copy)
     df = df.copy()
+    original_ids = df['ID'].values.copy()
+    
+    # 1. Base Preprocessing & Sort (Isolated to local scope for FE arithmetic safety)
+    # We sort by scenario_id and ID to ensure rolling/sequence features are computed correctly.
     df = df.sort_values(by=["scenario_id", "ID"]).reset_index(drop=True)
     
     # 2. Sequential Feature Engineering (Always run for all modes)
@@ -281,28 +286,19 @@ def build_features(df, schema, mode='raw', reconstructor=None, residuals=None, r
     # 3. Embedding Logic (Only in 'full' mode with residuals)
     if mode == 'full' and reconstructor is not None and residuals is not None:
         logger.info("[FEATURE_BUILD] Populating EMBED features using residuals...")
-        # We use a dummy test df for generate_supercharged_latent_features
-        # since it expects (train, test) but we are building one at a time here.
-        # Actually, let's keep it simple: if mode is full, we assume the embed features 
-        # will be populated by generate_supercharged_latent_features separately 
-        # or we integrate it here.
-        
-        # For now, we'll let main.py call generate_supercharged_latent_features 
-        # and THEN call build_features(mode='full') to enforce the contract.
+        # (This is handled by main.py calling generate_supercharged_latent_features separately 
+        # or we integrate it here if needed. Current main calls generate_supervised_latent_features 
+        # which sorts on its own - we must ensure it also follows the contract.)
         pass
 
     # 4. ENFORCE SCHEMA (The "Contract")
     all_schema_features = schema['all_features']
-    
-    # Ensure ID_COLS and TARGET are preserved if they exist (for internal use, not final X)
-    preserved_cols = [c for c in Config.ID_COLS + [Config.TARGET] if c in df.columns]
     
     # Create missing features with fallback policy
     missing_features = []
     for col in all_schema_features:
         if col not in df.columns:
             missing_features.append(col)
-            # Fallback policy
             if 'ratio' in col or 'rel_to' in col:
                 df[col] = 1.0
             elif 'std' in col or 'volatility' in col:
@@ -313,8 +309,15 @@ def build_features(df, schema, mode='raw', reconstructor=None, residuals=None, r
     if missing_features:
         logger.info(f"[MISSING_FEATURE_FILLED] {len(missing_features)} features were missing and filled with defaults.")
 
+    # [RESTORE ORIGINAL ORDER] (Rule 2 - ID Anchored)
+    # We set ID as index, select in original ID order, then reset index.
+    df = df.set_index('ID').loc[original_ids].reset_index()
+    
+    # Validation Assertion (Rule 1 & 2 boundary)
+    assert (df['ID'].values == original_ids).all(), "[CONTRACT_VIOLATION] ID order mutated during build_features!"
+    logger.info("[ORDER_RESTORED] Original CSV row identity successfully protected.")
+
     # 5. Fixed Ordering & Index Alignment
-    # We return the features only for training/inference
     X_df = df[all_schema_features].astype('float32')
     
     # [PHASE 2] Ensure no NaNs from rolling/FE operations
@@ -330,6 +333,7 @@ def build_features(df, schema, mode='raw', reconstructor=None, residuals=None, r
     
     # Return both X and the original df (with metadata) for stage separation
     return X_df, df
+
 
 # --- [PHASE 3: ASSERTION FIREWALL] ---
 def validate_feature_contract(df, schema):
@@ -1083,12 +1087,14 @@ def prune_collinear_features(df, feature_cols, threshold=0.98, protected_feature
 def prune_drift_features(train_df, test_df, feature_cols, threshold=0.15, protected_features=None):
     """Remove features with high train-test distribution drift (KS > threshold).
     Protected features are never removed.
+    Returns: remaining_features, dropped_features_dict (name -> ks_stat)
     """
     from scipy.stats import ks_2samp
     if protected_features is None:
         protected_features = []
     protected_set = set(protected_features)
     
+    dropped_info = {}
     to_drop = []
     n_sample = min(5000, len(train_df), len(test_df))
     
@@ -1106,7 +1112,8 @@ def prune_drift_features(train_df, test_df, feature_cols, threshold=0.15, protec
         ks_stat, _ = ks_2samp(tr_sample, te_sample)
         if ks_stat > threshold:
             to_drop.append(col)
+            dropped_info[col] = float(ks_stat)
     
     remaining = [f for f in feature_cols if f not in to_drop]
     logger.info(f"[DRIFT] Removed {len(to_drop)} features (KS > {threshold})")
-    return remaining, to_drop
+    return remaining, dropped_info

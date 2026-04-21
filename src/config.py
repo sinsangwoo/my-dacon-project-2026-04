@@ -2,8 +2,8 @@ import os
 
 class Config:
     # Execution Mode
-    MODE = 'full' # 'full' or 'debug'
-    RUN_ID = os.getenv('RUN_ID', 'default_run') # Added: Run-specific ID for isolation
+    MODE = 'full' # Full Pipeline mode enabled
+    RUN_ID = os.getenv('RUN_ID', 'full_restoration_v1')
     
     DEBUG_PHASE3 = False # For Phase 3 logic testing
     DEBUG_MINIMAL = False # Full pipeline sanity check (< 10s)
@@ -69,18 +69,22 @@ class Config:
     SPLIT_STRATEGY = 'GroupKFold' 
     ADAPTIVE_FOLDS = {'full': 5, 'debug': 2, 'trace': 2}
     NFOLDS = ADAPTIVE_FOLDS[MODE]
-    SEEDS = [42, 43, 44, 45, 46] if MODE == 'full' else [42]
+    SEEDS = [42] # Rule 1: Fixed Seed
     STABILITY_VAR_THRESHOLD = 0.5
     OVERFITTING_GAP_THRESHOLD = 0.2
     WORST_CASE_SELECTION = True
     EXTREME_TARGET_QUANTILE = 0.9
-    EXTREME_SAMPLE_WEIGHT = 3.0
+    EXTREME_SAMPLE_WEIGHT = 1.0
     PRED_VARIANCE_RATIO_TARGET_MIN = 0.7
     PRED_VARIANCE_RATIO_REJECT = 0.5
     ENSEMBLE_MAX_CORR = 0.95
     ADVERSARIAL_SAMPLE_SIZE = 20000
     
     # [DECOMPOSITION_CONTRACT]
+    ENABLE_CONTRASTIVE_AMP = False
+    CONTRASTIVE_AMP_FACTOR = 1.0
+    FORCED_AMP_MODE = False
+    
     ACTIVATION_IMPORTANCE_THRESHOLD = 0.20
     ACTIVATION_VARIANCE_LIFT_MIN = 0.5
     DECORRELATION_THRESHOLD = 0.90
@@ -155,17 +159,8 @@ class Config:
         raw_features.extend(["early_warning_flag", "early_warning_score"])
         
         # 2. Embed Features (Residual-dependent)
+        # [MISSION: EMBEDDING REMOVAL] Redundant and harmful features removed after forensic audit.
         embed_features = []
-        latent_patterns = ['embed_mean', 'embed_std', 'trend_proxy', 'volatility_proxy', 'weighted_mean', 'weighted_std']
-        for k in cls.MULTI_K:
-            for p in latent_patterns:
-                if 'proxy' in p:
-                    embed_features.append(f"{p}_{k}")
-                else:
-                    for d in range(cls.EMBED_DIM):
-                        embed_features.append(f"{p}_{k}_d{d}")
-        
-        embed_features.extend(['regime_proxy', 'local_density', 'similarity_entropy'])
         
         all_features = raw_features + embed_features
         
@@ -187,17 +182,18 @@ class Config:
     
     # Model Hyperparameters - LightGBM
     LGBM_PARAMS = {
-        'n_estimators': 2000,
+        'n_estimators': 300, # Fast Mode
         'learning_rate': 0.03,
-        'max_depth': 7,        # Reduced from 8 for memory
-        'num_leaves': 80,      # Reduced from 127 for memory
+        'max_depth': 7,
+        'num_leaves': 80,
         'subsample': 0.8,
         'colsample_bytree': 0.8,
         'reg_alpha': 0.5,
         'reg_lambda': 0.5,
         'random_state': 42,
         'verbose': -1,
-        'n_jobs': -1
+        'n_jobs': -1,
+        'early_stopping_rounds': 50 # Rule 4
     }
     
     # Decomposed Model Specific Params
@@ -206,9 +202,10 @@ class Config:
         'min_data_in_leaf': 100,
         'feature_fraction': 0.7,
         'learning_rate': 0.03,
-        'n_estimators': 1500,
+        'n_estimators': 300,
         'random_state': 42,
-        'verbose': -1
+        'verbose': -1,
+        'early_stopping_rounds': 50
     }
     
     EMBED_LGBM_PARAMS = {
@@ -216,9 +213,10 @@ class Config:
         'min_data_in_leaf': 30,
         'feature_fraction': 0.9,
         'learning_rate': 0.03,
-        'n_estimators': 1500,
+        'n_estimators': 300,
         'random_state': 43,
-        'verbose': -1
+        'verbose': -1,
+        'early_stopping_rounds': 50
     }
     
     META_LGBM_PARAMS = {
@@ -226,19 +224,19 @@ class Config:
         'min_data_in_leaf': 20,
         'feature_fraction': 1.0,
         'learning_rate': 0.05,
-        'n_estimators': 500,
+        'n_estimators': 300,
         'random_state': 44,
         'verbose': -1
     }
     
     # Model Hyperparameters - CatBoost
     CAT_PARAMS = {
-        'n_estimators': 2000,
+        'n_estimators': 300,
         'learning_rate': 0.03,
-        'max_depth': 7,       # Reduced from 8 for memory
+        'max_depth': 7,
         'random_state': 42,
         'verbose': False,
-        'early_stopping_rounds': 100,
+        'early_stopping_rounds': 50, # Rule 4
         'loss_function': 'MAE',
         'eval_metric': 'MAE',
         'allow_writing_files': False,

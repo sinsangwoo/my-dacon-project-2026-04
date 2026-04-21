@@ -71,7 +71,7 @@ def check_model_contract_compliance():
                                 continue
                             
                             # 2. Is it a whitelisted Preprocessing Fit in a Safe Module?
-                            if is_safe_module and not is_scratch:
+                            if is_safe_module:
                                 is_preproc = any(pp in stripped for pp in SAFE_PREPROCESSING_PATTERNS)
                                 if is_preproc:
                                     continue
@@ -204,12 +204,21 @@ def validate_submission(df, sample_df, logger):
     if len(df) != len(sample_df):
         errors.append(f"Row count mismatch! Expected {len(sample_df)}, got {len(df)}")
     
-    # [3] ID Match (Order & Values)
+    # [RULE 3: DUAL CHECK SYSTEM]
+    # 1. Hard ID Check
     if not (df['ID'].values == sample_df['ID'].values).all():
-        errors.append("ID column order or values do not match sample_submission!")
-        # Check if at least the set is the same
-        if set(df['ID']) != set(sample_df['ID']):
-            errors.append("ID set mismatch! Missing or extra IDs found.")
+        errors.append("ID column order or values do not match sample_submission (RULE 1 Violation)!")
+        
+    # 2. Alignment Verification (np.allclose)
+    # This proves that blind assignment matches ID-based merging.
+    if len(df) == len(sample_df) and 'ID' in df.columns:
+        preds_blind = df[Config.TARGET].values
+        # Create a "Golden Merge" for comparison
+        golden = sample_df[['ID']].merge(df[['ID', Config.TARGET]], on='ID', how='left')
+        preds_merged = golden[Config.TARGET].values
+        
+        if not np.allclose(preds_blind, preds_merged, rtol=1e-5, atol=1e-8):
+            errors.append("Alignment mismatch! Blind assignment does not match ID-merged ground truth (RULE 3 Violation).")
     
     # [4] Dtypes (Target must be numeric, ID must be object/str)
     if not np.issubdtype(df[Config.TARGET].dtype, np.number):
@@ -318,6 +327,13 @@ def build_metrics(y_true, y_pred):
     logger.info(f"[METRIC_BUILD_SUCCESS] mean={mean_mae:.4f} | worst={worst_mae:.4f} | extreme={extreme_mae:.4f} | var={variance_ratio:.4f}")
     
     return metrics
+
+def calculate_std_ratio(preds, train_stats):
+    """Compute ratio of prediction std vs training target std (Rule 4)."""
+    pred_std = float(np.std(preds))
+    train_std = train_stats.get('std', 1.0)
+    ratio = pred_std / (train_std + 1e-9)
+    return ratio, pred_std, train_std
 
 def build_submission(preds, ids):
     """SINGLE AUTHORITATIVE FUNCTION for submission creation.

@@ -30,6 +30,9 @@ class Trainer:
         self.embed_idx = [schema['feature_to_index'][f] for f in schema['embed_features']]
         self.all_idx = list(range(len(schema['all_features'])))
         
+        # Rule 4: Feature stability tracking
+        self.fold_importances = []
+        
         # [FINAL_CONTRACT_CHECK]
         logger.info(f"[FINAL_CONTRACT_CHECK]")
         logger.info(f"X_type: {type(X)} | shape: {X.shape}")
@@ -194,6 +197,8 @@ class Trainer:
                 "std_mae": None,
                 "worst_mae": None,
                 "overall_mae": None,
+                "mae_q90": None,
+                "mae_q95": None,
                 "pred_std": None,
                 "target_std": float(np.std(y_true)),
                 "variance_ratio": None,
@@ -202,19 +207,28 @@ class Trainer:
         pred_std = float(np.std(preds))
         target_std = float(np.std(y_true))
         ratio = pred_std / (target_std + 1e-9)
+        
+        # Rule 1: Tail Performance Audit
+        q90_thresh = np.quantile(y_true, 0.9)
+        q95_thresh = np.quantile(y_true, 0.95)
+        mae_q90 = mean_absolute_error(y_true[y_true >= q90_thresh], preds[y_true >= q90_thresh])
+        mae_q95 = mean_absolute_error(y_true[y_true >= q95_thresh], preds[y_true >= q95_thresh])
+
         summary = {
             "model": model_name,
             "mean_mae": float(np.mean(fold_maes)),
             "std_mae": float(np.std(fold_maes)),
             "worst_mae": float(np.max(fold_maes)),
             "overall_mae": float(mean_absolute_error(y_true, preds)),
+            "mae_q90": float(mae_q90),
+            "mae_q95": float(mae_q95),
             "pred_std": pred_std,
             "target_std": target_std,
             "variance_ratio": float(ratio),
         }
         logger.info(
             f"[CV_SUMMARY] {model_name.upper()} | mean={summary['mean_mae']:.6f} | "
-            f"std={summary['std_mae']:.6f} | worst={summary['worst_mae']:.6f} | "
+            f"mae_q90={summary['mae_q90']:.4f} | mae_q95={summary['mae_q95']:.4f} | "
             f"variance_ratio={summary['variance_ratio']:.4f}"
         )
         if ratio < Config.PRED_VARIANCE_RATIO_TARGET_MIN:
@@ -323,9 +337,12 @@ class Trainer:
                     model = LGBMRegressor(**params_fold)
 
                 # [MISSION: ZERO WARNING POLICY] Rule 10
-                val_preds_fold, test_preds_fold, _ = self._train_model(
+                val_preds_fold, test_preds_fold, fold_imp = self._train_model(
                     model, X_tr, y_tr, X_val, y_val, X_test, sample_weight=sw_tr
                 )
+                
+                if fold_imp is not None:
+                    self.fold_importances.append(fold_imp)
                 
                 seed_oof[val_idx] = val_preds_fold
                 seed_test += test_preds_fold / Config.NFOLDS
@@ -366,6 +383,9 @@ class Trainer:
 
     def fit_embed_model(self):
         """Train the latent model on pseudo-temporal features with Activation Forcing."""
+        if len(self.embed_idx) == 0:
+            raise RuntimeError("[FEATURE_AUDIT] embed_idx is empty! Cannot train embed model with 0 features. Aborting Phase 5.")
+        
         logger.info(f"[STAGE: EMBED_MODEL] Training on {len(self.embed_idx)} features...")
         
         # [PHASE 4] Slice using indices from schema
@@ -380,26 +400,14 @@ class Trainer:
             custom_params=Config.EMBED_LGBM_PARAMS
         )
         
-        # Activation Check
-        if not self._run_activation_check('embed', 'raw'):
-            logger.warning("[ACTIVATION_FAILURE] Embedding model weak. Applying Contrastive Amplification...")
-            # Contrastive Amplification: 2.0x Scaling
-            X_amp_tr = X_embed_tr * 2.0
-            X_amp_te = X_embed_te * 2.0
-            
-            mae, oof = self.train_kfolds(
-                X_subset=X_amp_tr,
-                X_test_subset=X_amp_te,
-                result_key='embed',
-                custom_params=Config.EMBED_LGBM_PARAMS
-            )
-            # Re-check
-            self._run_activation_check('embed', 'raw')
-            
         return mae, oof
 
     def _run_activation_check(self, embed_key, raw_key):
         """Verify if embedding model satisfies the dominance contract."""
+        if Config.FORCED_AMP_MODE:
+            logger.warning("[FORCED_ACTIVATION] enabled. Bypassing check and returning False.")
+            return False
+            
         oof_embed = self.oof_preds[embed_key]
         oof_raw = self.oof_preds[raw_key]
         
@@ -631,6 +639,102 @@ class Trainer:
             logger.warning(f"[DRIFT_ALERT] Adversarial AUC {auc_mean:.4f} > 0.7")
         return self.adversarial_summary
 
+    def check_feature_stability(self, feature_names):
+        """Rule 4: Check top 20 features importance consistency across folds."""
+        if not self.fold_importances:
+            logger.warning("[STABILITY_CHECK] No fold importances captured.")
+            return
+            
+        imp_df = pd.DataFrame(self.fold_importances, columns=feature_names)
+        mean_imp = imp_df.mean()
+        std_imp = imp_df.std()
+        
+        # Stability score: coefficient of variation (std / mean)
+        cv = std_imp / (mean_imp + 1e-9)
+        
+        top_20 = mean_imp.sort_values(ascending=False).head(20).index
+        top_20_cv = cv[top_20]
+        
+        logger.info("\n--- [RULE 4: FEATURE STABILITY CHECK] ---")
+        unstable_count = 0
+        for feat in top_20:
+            stability = top_20_cv[feat]
+            logger.info(f"Feature: {feat:<40} | Mean Imp: {mean_imp[feat]:>10.2f} | CV: {stability:>6.4f}")
+            if stability > 0.5: # Threshold for instability
+                logger.warning(f"[UNSTABLE_FEATURE] {feat} has high variance across folds (CV={stability:.4f})")
+                unstable_count += 1
+        
+        if unstable_count > 5:
+            logger.warning(f"[STABILITY_ALERT] {unstable_count} of top 20 features are unstable!")
+        else:
+            logger.info(f"[STABILITY_OK] Feature importance consistent across folds.")
+        logger.info("--- [/RULE 4] ---\n")
+        return top_20_cv.to_dict()
+
+    def run_cv_lb_gap_simulation(self, X, y, groups):
+        """Rule 3: Simulate distribution shift and evaluate CV vs LB gap."""
+        logger.info("\n--- [RULE 3: CV vs LB GAP SIMULATION] ---")
+        
+        unique_groups = np.unique(groups)
+        np.random.seed(42)
+        np.random.shuffle(unique_groups)
+        
+        # Split groups: 80% pseudo-train, 20% pseudo-test
+        split_idx = int(len(unique_groups) * 0.8)
+        tr_groups = unique_groups[:split_idx]
+        te_groups = unique_groups[split_idx:]
+        
+        tr_mask = np.isin(groups, tr_groups)
+        te_mask = np.isin(groups, te_groups)
+        
+        X_tr, y_tr = X[tr_mask], y[tr_mask]
+        X_te, y_te = X[te_mask], y[te_mask]
+        tr_groups_sub = groups[tr_mask]
+        
+        logger.info(f"[SIMULATION] Pseudo-Train: {len(X_tr)} rows | Pseudo-Test: {len(X_te)} rows")
+        
+        # Train on pseudo-train
+        params = Config.RAW_LGBM_PARAMS.copy()
+        params['n_estimators'] = 500 # Slightly more for simulation
+        
+        # We use a simple 3-fold CV on pseudo-train
+        from sklearn.model_selection import GroupKFold
+        kf = GroupKFold(n_splits=3)
+        
+        cv_maes = []
+        oof_preds = np.zeros(len(X_tr))
+        
+        for fold, (f_tr_idx, f_val_idx) in enumerate(kf.split(X_tr, y_tr, groups=tr_groups_sub)):
+            model = LGBMRegressor(**params)
+            SAFE_FIT(model, X_tr[f_tr_idx], y_tr[f_tr_idx], 
+                     eval_set=[(X_tr[f_val_idx], y_tr[f_val_idx])],
+                     callbacks=[lgb.early_stopping(50), lgb.log_evaluation(period=0)])
+            
+            fold_preds = SAFE_PREDICT(model, X_tr[f_val_idx])
+            oof_preds[f_val_idx] = fold_preds
+            cv_maes.append(mean_absolute_error(y_tr[f_val_idx], fold_preds))
+            
+        cv_mae = np.mean(cv_maes)
+        
+        # Final model on full pseudo-train to predict pseudo-test
+        params_final = params.copy()
+        params_final['early_stopping_rounds'] = None
+        final_model = LGBMRegressor(**params_final)
+        SAFE_FIT(final_model, X_tr, y_tr)
+        te_preds = SAFE_PREDICT(final_model, X_te)
+        te_mae = mean_absolute_error(y_te, te_preds)
+        
+        gap = te_mae - cv_mae
+        logger.info(f"[SIMULATION] CV MAE: {cv_mae:.6f} | Pseudo-Test MAE: {te_mae:.6f} | Gap: {gap:.6f}")
+        
+        if gap > 1.0:
+            logger.warning(f"[OVERFIT_ALERT] CV vs LB Gap {gap:.4f} > 1.0! Model may be overfitting to training scenarios.")
+        else:
+            logger.info(f"[GENERALIZATION_OK] Gap {gap:.4f} within safe limits.")
+        
+        logger.info("--- [/RULE 3] ---\n")
+        return {"cv_mae": float(cv_mae), "te_mae": float(te_mae), "gap": float(gap)}
+
     def is_ensemble_allowed(self):
         if (self.oof_cat == 0).all():
             return False
@@ -810,7 +914,8 @@ class Trainer:
                 'learning_rate': 0.1,
                 'random_state': seed,
                 'importance_type': 'gain',
-                'n_jobs': -1
+                'n_jobs': -1,
+                'early_stopping_rounds': None # Disable for probe
             })
             
             probe = LGBMRegressor(**params)

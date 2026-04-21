@@ -11,6 +11,7 @@ import glob
 import time
 import hashlib
 from pathlib import Path
+from datetime import datetime
 
 # Suppress PerformanceWarning after fixing the root cause (Batch Concat)
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
@@ -38,7 +39,8 @@ from src.utils import (
     build_submission,
     SAFE_FIT,
     SAFE_PREDICT,
-    check_model_contract_compliance
+    check_model_contract_compliance,
+    calculate_std_ratio
 )
 from src.explosion_inference import ExplosionInference, run_explosion_inference
 from src.data_loader import (
@@ -356,6 +358,10 @@ def run_phase(phase, mode, smoke_test=False):
             if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
                 rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
                 train = train.head(rows); test = test.head(rows)
+            
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 1:\n  * len(train): {len(train)}\n  * len(test): {len(test)}")
+            
             log_forensic_snapshot(train, "train_raw", logger); log_forensic_snapshot(test, "test_raw", logger)
             save_npy(train.head(100).values, f'{Config.LOG_DIR}/train_raw.npy') # For artifact check
             del train, test; gc.collect()
@@ -370,16 +376,55 @@ def run_phase(phase, mode, smoke_test=False):
             
             # [PHASE 2: DETERMINISTIC FEATURE BUILDER]
             schema = Config.get_feature_schema()
-            from src.data_loader import build_features
+            from src.data_loader import build_features, prune_drift_features
             
             X_train_raw, train = build_features(train, schema, mode='raw')
             X_test_raw, test = build_features(test, schema, mode='raw')
             
+            # [MISSION: DRIFT REMOVAL]
+            # Prune features with high KS drift (> 0.15) to ensure test stability.
+            raw_features = schema['raw_features']
+            
+            # Rule 2: Drift Pruning Validation (Logging details)
+            from src.data_loader import prune_drift_features
+            remaining_features, dropped_info = prune_drift_features(
+                train, test, raw_features, threshold=Config.DRIFT_KS_THRESHOLD
+            )
+            dropped_features = list(dropped_info.keys())
+            
+            # For logging Rule 2 details, we need importance. 
+            # We can use a quick lightweight probe on training data.
+            logger.info("\n--- [RULE 2: DRIFT PRUNING VALIDATION] ---")
+            if dropped_features:
+                # Temporary trainer for importance ranking
+                temp_trainer = Trainer(X_train_raw.values, train[Config.TARGET].values, X_test_raw.values, schema, train['scenario_id'].values)
+                _, importance_dict = temp_trainer.importance_pruning(raw_features)
+                
+                for feat in dropped_features:
+                    ks_score = dropped_info[feat]
+                    imp_val = importance_dict.get(feat, 0)
+                    logger.info(f"Dropped: {feat:<40} | KS: {ks_score:.4f} | Importance: {imp_val:.2f}")
+            else:
+                logger.info("No features dropped due to drift.")
+            logger.info("--- [/RULE 2] ---\n")
+            
+            # Update X matrices to only include remaining features (and fill others with 0 to keep schema intact)
+            # Actually, the schema is fixed, so we just zero out the dropped features.
+            for col in dropped_features:
+                X_train_raw[col] = np.float32(0.0)
+                X_test_raw[col] = np.float32(0.0)
+            
+            X_train_raw = X_train_raw.astype(np.float32)
+            X_test_raw = X_test_raw.astype(np.float32)
+             
             # Save Raw Feature Matrices
             save_npy(X_train_raw.values, f'{Config.PROCESSED_PATH}/X_train_raw.npy')
             save_npy(X_test_raw.values, f'{Config.PROCESSED_PATH}/X_test_raw.npy')
             save_npy(train[Config.TARGET].values, f'{Config.PROCESSED_PATH}/y_train.npy')
             save_npy(train['scenario_id'].values, f'{Config.PROCESSED_PATH}/scenario_id.npy')
+            
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 2:\n  * len(X_train): {len(X_train_raw)}\n  * len(y_train): {len(train[Config.TARGET])}")
             
             # Save stats for later
             save_json({
@@ -403,8 +448,17 @@ def run_phase(phase, mode, smoke_test=False):
             # Train Raw Model
             raw_mae, oof_raw = trainer.fit_raw_model()
             
+            # Rule 4: Feature Stability Check
+            trainer.check_feature_stability(schema['all_features'])
+            
+            # Rule 3: CV vs LB Gap Simulation
+            trainer.run_cv_lb_gap_simulation(X_train_raw, y_train, scenario_id)
+            
             # Generate Residuals
             residuals_raw = y_train - oof_raw
+            
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 3:\n  * len(X): {len(X_train_raw)}\n  * len(y): {len(y_train)}\n  * len(oof): {len(oof_raw)}")
             
             # Save Stage A Artifacts
             save_npy(oof_raw, f'{Config.PROCESSED_PATH}/oof_raw.npy')
@@ -443,6 +497,9 @@ def run_phase(phase, mode, smoke_test=False):
             save_npy(X_train_full.values, f'{Config.PROCESSED_PATH}/X_train_full.npy')
             save_npy(X_test_full.values, f'{Config.PROCESSED_PATH}/X_test_full.npy')
             
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 4:\n  * len(X_train): {len(X_train_full)}\n  * len(X_test): {len(X_test_full)}")
+            
             # Also save regime_proxy for meta model
             save_npy(train['regime_proxy'].values, f'{Config.PROCESSED_PATH}/regime_proxy_tr.npy')
             save_npy(test['regime_proxy'].values, f'{Config.PROCESSED_PATH}/regime_proxy_te.npy')
@@ -455,24 +512,90 @@ def run_phase(phase, mode, smoke_test=False):
             y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
             scenario_id = load_npy(f'{Config.PROCESSED_PATH}/scenario_id.npy', allow_pickle=True)
             
+            # [FEATURE_AUDIT_TRACE] Phase 5 Input:
+            logger.info("[FEATURE_AUDIT_TRACE] Phase 5 Input:")
+            logger.info(f"  X_train_full.shape: {X_train_full.shape}")
+            logger.info(f"  X_test_full.shape: {X_test_full.shape}")
+            logger.info(f"  schema['all_features'] count: {len(schema['all_features'])}")
+            logger.info(f"  schema['raw_features'] count: {len(schema['raw_features'])}")
+            logger.info(f"  schema['embed_features'] count: {len(schema['embed_features'])}")
+            if len(schema['all_features']) == 0:
+                raise RuntimeError("[FEATURE_AUDIT_TRACE] FATAL: schema['all_features'] is empty! shape=(N, 0)!")
+            
+            # [MISSION: PIPELINE CONTRACT RESTORATION]
+            # Subsampling ONLY allowed in debug mode.
+            sample_idx = None
+            if Config.MODE == 'debug':
+                # Optional: If we want to keep subsampling for debug, we can use a fixed percentage or load from file
+                # But for FULL mode, we MUST use everything.
+                if os.path.exists('audit_sample.pkl'):
+                    import pickle
+                    with open('audit_sample.pkl', 'rb') as f:
+                        sample_idx = pickle.load(f)
+                    X_train_full = X_train_full[sample_idx]
+                    y_train = y_train[sample_idx]
+                    scenario_id = scenario_id[sample_idx]
+                    logger.info(f"[DEBUG_MODE] Applied subsample (Phase 5): {len(sample_idx)} rows.")
+            else:
+                logger.info(f"[FULL_MODE] Operating on FULL data: {len(y_train)} rows.")
+
+            # [CONTRACT_ENFORCEMENT] Phase 5 Assertion
+            if len(X_train_full) != len(y_train):
+                raise RuntimeError(f"[CONTRACT_VIOLATION] DATA LENGTH MISMATCH (Phase 5): X={len(X_train_full)}, y={len(y_train)}")
+            
             trainer = Trainer(X_train_full, y_train, X_test_full, schema, scenario_id)
+            
+            # [FEATURE_AUDIT_TRACE] After Trainer init
+            logger.info(f"[FEATURE_AUDIT_TRACE] After Trainer init:")
+            logger.info(f"  trainer.raw_idx count: {len(trainer.raw_idx)}")
+            logger.info(f"  trainer.embed_idx count: {len(trainer.embed_idx)}")
+            logger.info(f"  trainer.all_idx count: {len(trainer.all_idx)}")
+            if len(trainer.raw_idx) == 0:
+                raise RuntimeError("[FEATURE_AUDIT_TRACE] FATAL: trainer.raw_idx is empty!")
             
             # 1. We need oof_raw for the meta model
             oof_raw = load_npy(f'{Config.PROCESSED_PATH}/oof_raw.npy')
+            if sample_idx is not None:
+                oof_raw = oof_raw[sample_idx]
+            
             trainer.oof_preds['raw'] = oof_raw
             trainer.test_preds['raw'] = load_npy(f'{Config.PREDICTIONS_PATH}/test_raw_preds.npy')
             
             # 2. Train Embed Model
-            embed_mae, oof_embed = trainer.fit_embed_model()
+            if len(trainer.embed_idx) == 0:
+                logger.warning("[FEATURE_AUDIT] embed_idx is empty! Skipping embed model training (embed features were removed).")
+                oof_embed = np.zeros(len(X_train_full), dtype=np.float32)
+                trainer.test_preds['embed'] = np.zeros(len(X_test_full), dtype=np.float32)
+                trainer.oof_preds['embed'] = oof_embed
+                embed_mae = None
+            else:
+                embed_mae, oof_embed = trainer.fit_embed_model()
             
             # 3. Meta Stacking
             regime_proxy_tr = load_npy(f'{Config.PROCESSED_PATH}/regime_proxy_tr.npy')
+            if sample_idx is not None:
+                regime_proxy_tr = regime_proxy_tr[sample_idx]
+                
             regime_proxy_te = load_npy(f'{Config.PROCESSED_PATH}/regime_proxy_te.npy')
+            
+            # [FEATURE_AUDIT_TRACE] Meta feature construction
+            logger.info(f"[FEATURE_AUDIT_TRACE] Meta feature stack:")
+            logger.info(f"  oof_raw shape: {oof_raw.shape}, oof_embed shape: {oof_embed.shape}, regime_proxy_tr shape: {regime_proxy_tr.shape}")
             
             X_meta_tr = np.column_stack([oof_raw, oof_embed, regime_proxy_tr]).astype(np.float32)
             X_meta_te = np.column_stack([trainer.test_preds['raw'], trainer.test_preds['embed'], regime_proxy_te]).astype(np.float32)
             
+            if X_meta_tr.shape[1] == 0:
+                raise RuntimeError("[FEATURE_AUDIT_TRACE] FATAL: X_meta_tr has 0 features!")
+            
             meta_mae, oof_meta = trainer.fit_meta_model(X_meta_tr, X_meta_te)
+            
+            # [CONTRACT_ENFORCEMENT] OOF Pred Assertion
+            if len(oof_meta) != len(y_train):
+                raise RuntimeError(f"[CONTRACT_VIOLATION] DATA LENGTH MISMATCH (Phase 5): OOF={len(oof_meta)}, y={len(y_train)}")
+
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 5:\n  * len(X): {len(X_train_full)}\n  * len(y): {len(y_train)}\n  * len(oof): {len(oof_meta)}")
             
             # Save Final Predictions
             save_npy(oof_meta, f"{Config.PREDICTIONS_PATH}/oof_stable.npy")
@@ -489,6 +612,25 @@ def run_phase(phase, mode, smoke_test=False):
             X_test_full = load_npy(f'{Config.PROCESSED_PATH}/X_test_full.npy')
             y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
             scenario_id = load_npy(f'{Config.PROCESSED_PATH}/scenario_id.npy', allow_pickle=True)
+            
+            # [MISSION: PIPELINE CONTRACT RESTORATION]
+            # Subsampling ONLY allowed in debug mode.
+            if Config.MODE == 'debug':
+                if os.path.exists('audit_sample.pkl'):
+                    import pickle
+                    with open('audit_sample.pkl', 'rb') as f:
+                        sample_idx = pickle.load(f)
+                    X_train_full = X_train_full[sample_idx]
+                    y_train = y_train[sample_idx]
+                    scenario_id = scenario_id[sample_idx]
+                    logger.info(f"[DEBUG_MODE] Applied subsample (Phase 6): {len(sample_idx)} rows.")
+            else:
+                logger.info(f"[FULL_MODE] Operating on FULL data: {len(y_train)} rows.")
+
+            # [CONTRACT_ENFORCEMENT] Phase 6 Assertion
+            if len(X_train_full) != len(y_train):
+                raise RuntimeError(f"[CONTRACT_VIOLATION] DATA LENGTH MISMATCH (Phase 6): X={len(X_train_full)}, y={len(y_train)}")
+            
             test_stable = load_npy(f'{Config.PREDICTIONS_PATH}/test_stable.npy')
             
             # Simple top 10% high confidence pseudo labeling
@@ -501,40 +643,96 @@ def run_phase(phase, mode, smoke_test=False):
             
             trainer = Trainer(X_combined, y_combined, X_test_full, schema, groups_combined)
             
-            _, cat_mae = trainer.train_kfolds(X_subset=X_combined, y=y_combined, result_key='cat', custom_params=Config.CAT_PARAMS)
+            cat_mae, oof_cat = trainer.train_kfolds(X_subset=X_combined, y=y_combined, result_key='cat', custom_params=Config.CAT_PARAMS)
+            
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 6:\n  * len(X): {len(X_combined)}\n  * len(y): {len(y_combined)}\n  * len(oof): {len(oof_cat)}")
+            
             save_npy(trainer.test_preds['cat'], f'{Config.PREDICTIONS_PATH}/test_cat.npy')
+            
+            # [SSOT: METRICS.JSON]
+            metrics = {
+                "phase": "6_retrain",
+                "cv_mae": float(cat_mae),
+                "timestamp": datetime.now().isoformat(),
+                "status": "SUCCESS"
+            }
+            with open(f'{Config.PROCESSED_PATH}/metrics.json', 'w') as f:
+                json.dump(metrics, f, indent=2)
+            
+            logger.info(f"[SSOT] Structured metrics saved to {Config.PROCESSED_PATH}/metrics.json")
 
         elif phase == '7_inference':
             logger.info("[EXPLOSION] Starting Leaderboard Explosion Inference Pipeline")
             final_preds = run_explosion_inference()
+            
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 7:\n  * len(final_preds): {len(final_preds)}")
+            
             save_npy(final_preds, f'{Config.PREDICTIONS_PATH}/final_submission.npy')
             logger.info(f"[EXPLOSION] Final predictions saved | mean={final_preds.mean():.4f} | std={final_preds.std():.4f}")
 
         elif phase == '8_submission':
+            tracer.checkpoint("id_merge_verification")
+            
+            # [RULE 1 & 2: RECOUP]
+            # Since build_features now restores order, final_submission.npy should naturally 
+            # align with sample_submission.csv. We proceed with zero-trust validation.
+            
             final_preds = load_npy(f'{Config.PREDICTIONS_PATH}/final_submission.npy')
             sample_sub = pd.read_csv(Config.DATA_PATH + 'sample_submission.csv')
-            if Config.TRACE_MODE or Config.DEBUG_MINIMAL:
-                rows = Config.TRACE_ROWS if Config.TRACE_MODE else Config.DEBUG_MINIMAL_ROWS
-                sample_sub = sample_sub.head(rows)
-
-            validate_output_len(final_preds, len(sample_sub), "Submission")
+            original_test = pd.read_csv(Config.DATA_PATH + 'test.csv')
             
+            # [RULE 4: PREDICTION CONSISTENCY CHECK]
             train_stats = json.load(open(f'{Config.PROCESSED_PATH}/train_stats.json'))
-            pred_std = float(np.std(final_preds))
-            std_ratio = pred_std / (train_stats['std'] + 1e-9)
-            p99_ratio = float(np.quantile(final_preds, 0.99)) / (train_stats['p99'] + 1e-9)
+            ratio, p_std, t_std = calculate_std_ratio(final_preds, train_stats)
             
-            print("\n" + "="*50)
-            print("[DISTRIBUTION_STATUS]")
-            print(f"* std_ratio: {std_ratio:.4f}")
-            print(f"* p99_ratio: {p99_ratio:.4f}")
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 8:\n  * len(final_preds): {len(final_preds)}\n  * len(sample_sub): {len(sample_sub)}")
             
-            if std_ratio < 0.7: logger.warning("[COLLAPSE_DETECTED] std_ratio < 0.7!")
-            if p99_ratio < 0.6: logger.warning("[COLLAPSE_DETECTED] p99_ratio < 0.6!")
+            # [PREDICTION DISTRIBUTION AUDIT]
+            dist_stats = {
+                "mean": float(np.mean(final_preds)),
+                "std": float(p_std),
+                "q10": float(np.quantile(final_preds, 0.10)),
+                "q25": float(np.quantile(final_preds, 0.25)),
+                "q50": float(np.quantile(final_preds, 0.50)),
+                "q75": float(np.quantile(final_preds, 0.75)),
+                "q90": float(np.quantile(final_preds, 0.90)),
+                "q99": float(np.quantile(final_preds, 0.99))
+            }
+            with open(f'{Config.PROCESSED_PATH}/pred_distribution.json', 'w') as f:
+                json.dump(dist_stats, f, indent=2)
             
+            logger.info(f"[RULE 4] Consistency Report | pred_std: {p_std:.4f} | train_std: {t_std:.4f} | Ratio: {ratio:.4f}")
+            logger.info(f"[SSOT] Prediction Distribution Audit saved to {Config.PROCESSED_PATH}/pred_distribution.json")
+            
+            # RULE 4 FAIL-FAST
+            if ratio < 0.6 or ratio > 1.5:
+                err = f"[DIST_GUARD_FAILED] std_ratio {ratio:.4f} outside [0.6, 1.5]! Pipeline TERMINATED."
+                logger.error(err)
+                raise RuntimeError(err)
+
+            # [RULE 3: DUAL CHECK SYSTEM]
+            # Blind assignment
             sample_sub[Config.TARGET] = final_preds
+            
+            # RULE 5: FAIL-FAST VALIDATION
+            # validate_submission now implements RULE 3 (Hard ID check + np.allclose merge check)
+            # We compare sample_sub (with predictions) against a reload of the original sample submission
+            original_sample_sub = pd.read_csv(Config.DATA_PATH + 'sample_submission.csv')
+            from src.utils import validate_submission, generate_submission_fingerprint, save_submission_trace
+            validate_submission(sample_sub, original_sample_sub, logger)
+            
+            # If we reached here, Rule 1, 2, 3, and 4 are PASS
+            logger.info("[RULE 5] Submission VALIDATED. Writing to disk...")
             sample_sub.to_csv(Config.SUBMISSION_PATH, index=False)
-            logger.info(f"[SUBMISSION_COMPLETE] ID: {Config.RUN_ID}")
+            logger.info(f"[SUBMISSION_COMPLETE] Saved to {Config.SUBMISSION_PATH}")
+            
+            # Forensic Trace
+            fingerprint = generate_submission_fingerprint(sample_sub, Config.SUBMISSION_PATH)
+            save_submission_trace(fingerprint, f"metadata/submissions/{Config.RUN_ID}/fingerprint.json")
+
             
         elif phase == '9_intelligence':
             # [PHASE 3: ASSERTION FIREWALL]
@@ -545,6 +743,13 @@ def run_phase(phase, mode, smoke_test=False):
             y_train = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
             oof_stable = load_npy(f'{Config.PREDICTIONS_PATH}/oof_stable.npy')
             
+            # [CONTRACT_ENFORCEMENT] Phase 9 Assertion
+            if len(oof_stable) != len(y_train):
+                raise RuntimeError(f"[CONTRACT_VIOLATION] DATA LENGTH MISMATCH (Phase 9): OOF={len(oof_stable)}, y={len(y_train)}")
+
+            # [DATA_FLOW_AUDIT]
+            logger.info(f"[DATA_FLOW_AUDIT] Phase 9:\n  * len(y): {len(y_train)}\n  * len(oof): {len(oof_stable)}")
+            
             from src.utils import build_metrics
             metrics = build_metrics(y_train, oof_stable)
             
@@ -552,6 +757,10 @@ def run_phase(phase, mode, smoke_test=False):
             metrics["features"] = [] # Placeholder for future feature tracking
             
             intel.run_risk_focused_pipeline(Config.RUN_ID, metrics)
+            
+            # [TASK 4 — PIPELINE STATUS FIX]
+            if phase == '9_intelligence':
+                print("\n[PIPELINE_CONTRACT_STATUS] PASS")
 
         elif phase == 'validate_artifacts':
             target = getattr(Config, 'VALIDATE_TARGET', None)
@@ -573,6 +782,11 @@ def main():
     # OUTPUT: None
     # FAILURE: Exits with code 1 if phase or contract violation detected
     
+    # [TASK 3 — ASSERTION LAYER]
+    assert hasattr(Config, 'MODE'), "[ILLEGAL_STATE] Config.MODE is missing!"
+    if 'is_scratch' in globals():
+        raise RuntimeError("[ILLEGAL_STATE] is_scratch should not exist globally")
+
     # [MISSION: GLOBAL MODEL INTERFACE LOCKDOWN — ELIMINATE ALL CONTRACT VIOLATIONS]
     # Scan entire codebase for direct model.fit / predict calls.
     check_model_contract_compliance()

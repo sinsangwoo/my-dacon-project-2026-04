@@ -230,7 +230,9 @@ def run_phase(phase, mode, smoke_test=False):
                 
                 # Apply features strictly via pre-computed cache
                 from src.data_loader import apply_latent_features
-                test_df_full = apply_latent_features(test_base, reconstructor, scaler=scaler)
+                # [PHASE 2: UNIFIED SCALING] Scale test data before latent population
+                test_base_scaled = scaler.transform(test_base, FEATURE_SCHEMA['raw_features'])
+                test_df_full = apply_latent_features(test_base_scaled, reconstructor, scaler=None)
                 X_test_f = test_df_full[fold_features].values.astype(np.float32)
                 
                 from src.utils import SAFE_PREDICT

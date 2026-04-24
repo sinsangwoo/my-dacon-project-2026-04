@@ -58,7 +58,7 @@ def get_feature_schema():
     for f1, f2 in interaction_pairs:
         raw_features.append(f"inter_{f1}_x_{f2}")
         
-    raw_features.extend(["early_warning_flag", "early_warning_score"])
+    raw_features.extend(["early_warning_flag", "early_warning_score", "is_extreme", "is_extreme_multi"])
     
     # [EMBED]
     embed_features = []

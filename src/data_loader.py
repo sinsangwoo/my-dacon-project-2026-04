@@ -50,19 +50,30 @@ class SuperchargedPCAReconstructor:
         self.pca_rank = PCA(n_components=8, svd_solver='randomized', random_state=42)
         self.global_pca_local = PCA(n_components=8, svd_solver='randomized', random_state=42)
         self.kmeans = KMeans(n_clusters=10, random_state=42, n_init='auto')
-        self.scaler = StandardScaler()
+        # self.scaler = StandardScaler() # [PHASE 2: REMOVE DUPLICATED SCALING]
         self.imputer = SimpleImputer(strategy='median')
         self.embed_dim = 32 
         
         self.pool_embed = None
         self.pool_norm = None
+        self.rank_reference = None # [PHASE 4: DETERMINISTIC RANK]
 
     def _get_multi_view_X(self, X):
         X_raw = X
         X_log = np.log1p(np.abs(X)) * np.sign(X)
         X_rank = np.zeros_like(X)
-        for i in range(X.shape[1]):
-            X_rank[:, i] = rankdata(X[:, i]) / (len(X) + 1)
+        
+        # [PHASE 4: DETERMINISTIC RANK]
+        # Use rank computed using global train reference instead of batch-size dependent rankdata
+        if self.rank_reference is not None:
+            for i in range(X.shape[1]):
+                # Efficient percentile computation using searchsorted on reference
+                ref = self.rank_reference[:, i]
+                X_rank[:, i] = np.searchsorted(ref, X[:, i]) / (len(ref) + 1)
+        else:
+            # Fallback for fit time (will be stored after first fit)
+            for i in range(X.shape[1]):
+                X_rank[:, i] = rankdata(X[:, i]) / (len(X) + 1)
         return X_raw, X_log, X_rank
 
     def fit(self, X_train, residuals=None):
@@ -84,9 +95,14 @@ class SuperchargedPCAReconstructor:
         
         # [DIM_TRACE] STEP 2: PREPROCESSING
         X_embed_base = self.imputer.fit_transform(X_embed_base)
-        X_scaled = self.scaler.fit_transform(X_embed_base)
-        logger.debug(f"[DIM_TRACE] after preprocessing: shape={X_scaled.shape} | source=imputer/scaler")
+        # X_scaled = self.scaler.fit_transform(X_embed_base) # [PHASE 2: REMOVE DUPLICATED SCALING]
+        X_scaled = X_embed_base # X_train MUST be already scaled by DriftShieldScaler
+        logger.debug(f"[DIM_TRACE] after preprocessing: shape={X_scaled.shape} | source=imputer")
         
+        # [PHASE 4: STORE RANK REFERENCE]
+        if self.rank_reference is None:
+            self.rank_reference = np.sort(X_scaled, axis=0)
+
         weights = 1.0 + np.abs(residuals) if residuals is not None else np.ones(len(X_np))
         X_weighted = X_scaled * weights[:, np.newaxis]
         
@@ -96,6 +112,16 @@ class SuperchargedPCAReconstructor:
         self.pca_rank.fit(X_w_rank)
         self.global_pca_local.fit(X_weighted)
         
+        # [PHASE 8: PCA QUALITY CONTROL]
+        for name, pca in [('raw', self.pca_raw), ('log', self.pca_log), ('rank', self.pca_rank), ('local', self.global_pca_local)]:
+            var_ratio = np.sum(pca.explained_variance_ratio_)
+            if var_ratio < 0.8:
+                err_msg = f"[PCA_QC_FAILURE] {name} PCA explained variance: {var_ratio:.4f} < 0.8. ABORTING."
+                logger.error(err_msg)
+                # Log per-component variance as requested
+                logger.info(f"[{name}] Component variance: {pca.explained_variance_ratio_}")
+                raise RuntimeError(err_msg)
+
         # [DIM_TRACE] STEP 3: EMBEDDING
         final_embed = self.get_embeddings(X_embed_base, already_scaled=True)
         logger.debug(f"[DIM_TRACE] after embedding: shape={final_embed.shape} | source=get_embeddings")
@@ -112,7 +138,8 @@ class SuperchargedPCAReconstructor:
             
             X_np = np.where(np.isinf(X_np), np.nan, X_np)
             X_np = self.imputer.transform(X_np)
-            X_scaled = self.scaler.transform(X_np)
+            # X_scaled = self.scaler.transform(X_np) # [PHASE 2: REMOVE DUPLICATED SCALING]
+            X_scaled = X_np # Assume already scaled by DriftShieldScaler if not already_scaled=True
         else:
             X_scaled = X_np
             
@@ -124,12 +151,15 @@ class SuperchargedPCAReconstructor:
         e_local = self.global_pca_local.transform(X_scaled)
         
         combined = np.hstack([e_raw, e_log, e_rank, e_local])
-        return (combined * 1.7).astype(np.float32)
+        # [PHASE 5: REMOVE FAKE STABILITY] Remove arbitrary 1.7 scaling
+        return combined.astype(np.float32)
 
     def build_fold_cache(self, df_train_pool):
         """Build and cache pool embeddings once per fold."""
         base_cols = Config.EMBED_BASE_COLS
-        self.pool_embed = self.get_embeddings(df_train_pool[base_cols].values)
+        # [PHASE 2: SSOT SCALING] Ensure we use already scaled data from df_train_pool if possible
+        # Or assume get_embeddings handles it if we pass raw (but it shouldn't anymore)
+        self.pool_embed = self.get_embeddings(df_train_pool[base_cols].values, already_scaled=True)
         self.pool_norm = self.pool_embed / (np.linalg.norm(self.pool_embed, axis=1, keepdims=True) + 1e-8)
         
     def clear_fold_cache(self):
@@ -137,10 +167,15 @@ class SuperchargedPCAReconstructor:
         self.pool_embed = None
         self.pool_norm = None
 
-    def calculate_graph_stats(self, df_target, df_train_pool=None):
-        """Compute multi-scale neighbor stats with high-performance indexing."""
+    def calculate_graph_stats(self, df_target, is_train=False):
+        """Compute multi-scale neighbor stats with high-performance indexing.
+        
+        [PHASE 3: KNN LEAKAGE ELIMINATION]
+        If is_train=True, excludes the self-index from neighbors.
+        """
         base_cols = Config.EMBED_BASE_COLS
-        target_embed_all = self.get_embeddings(df_target[base_cols].values)
+        # [PHASE 2: SSOT SCALING] Assume df_target is already scaled if it comes from the main pipeline
+        target_embed_all = self.get_embeddings(df_target[base_cols].values, already_scaled=True)
         
         if self.pool_embed is not None and self.pool_norm is not None:
             pool_embed = self.pool_embed
@@ -153,77 +188,121 @@ class SuperchargedPCAReconstructor:
         # Chunking to prevent memory explosion (OOM Guard)
         chunk_size = getattr(Config, 'EMBED_CHUNK_SIZE', 2000)
         n_targets = len(target_norm_all)
-        results_list = []
+        final_results = {}
         
         for i in range(0, n_targets, chunk_size):
             t_norm = target_norm_all[i:i+chunk_size]
             t_embed = target_embed_all[i:i+chunk_size]
             row_idx = np.arange(len(t_norm))[:, None]
             
-            chunk_res = {}
             # 1. Distance matrix for this chunk (Single Pass)
             dist_matrix = 1 - np.dot(t_norm, pool_norm.T)
             
             # 2. Efficient Neighbor Search (O(N) Partitioning)
+            # [PHASE 3: EXCLUDE SELF] If is_train, we need k+1 neighbors to exclude self
             max_k = max(Config.MULTI_K)
-            nn_indices_all = np.argpartition(dist_matrix, max_k, axis=1)[:, :max_k]
+            search_k = max_k + 1 if is_train else max_k
+            
+            nn_indices_all = np.argpartition(dist_matrix, search_k, axis=1)[:, :search_k]
             
             # 3. Sort subset for exact sim-order (Required for weighted stats)
             top_dists = dist_matrix[row_idx, nn_indices_all]
             sort_idx = np.argsort(top_dists, axis=1)
             nn_indices_all = nn_indices_all[row_idx, sort_idx]
             
-            weights = None # Keep track for similarity_entropy
+            # [RELIABILITY_FIX] Define candidates dists for leakage check
+            candidate_dists = dist_matrix[row_idx, nn_indices_all]
+            
+            # [PHASE 3: EXCLUDE SELF]
+            if is_train:
+                # [RELIABILITY_FIX] Enforce BOTH index exclusion AND distance floor (1e-6)
+                # We assume pool and target are aligned for self-exclusion in training
+                
+                # Identify self-neighbors by index (most reliable)
+                current_target_indices = np.arange(i, min(i + chunk_size, n_targets))
+                
+                # Check if first neighbor is self by index OR distance
+                first_neighbor_idx = nn_indices_all[:, 0]
+                first_neighbor_dist = candidate_dists[:, 0]
+                
+                # Leakage if (index match) OR (distance < 1e-12)
+                is_leakage = (first_neighbor_idx == current_target_indices) | (first_neighbor_dist < 1e-12)
+                
+                if is_leakage.any():
+                    # For leakage rows, shift neighbors by 1
+                    nn_indices_all = np.where(is_leakage[:, None], nn_indices_all[:, 1:max_k+1], nn_indices_all[:, :max_k])
+                    final_dists = np.where(is_leakage[:, None], candidate_dists[:, 1:max_k+1], candidate_dists[:, :max_k])
+                else:
+                    nn_indices_all = nn_indices_all[:, :max_k]
+                    final_dists = candidate_dists[:, :max_k]
+                
+                # [PART 2: FORCE DISTANCE] Enforce distance > 1e-6 for all selected neighbors
+                if (final_dists < 1e-6).any():
+                    logger.error(f"[KNN_LEAKAGE_CRITICAL] Distance < 1e-6 detected after exclusion! Min dist: {final_dists.min():.2e}")
+                    raise RuntimeError("[KNN_LEAKAGE_CRITICAL] Self-neighbor inclusion detected.")
+            else:
+                nn_indices_all = nn_indices_all[:, :max_k]
+                final_dists = candidate_dists[:, :max_k]
+
+            
+            # 4. Multi-Scale Feature Generation
             for k in Config.MULTI_K:
                 nn_indices = nn_indices_all[:, :k]
                 neighbor_embeds = pool_embed[nn_indices]
+                k_dists = final_dists[:, :k]
                 
+                # [PHASE 10: REMOVE DUPLICATED LOGIC]
                 # Vectorized Aggregations
-                chunk_res[f'embed_mean_{k}'] = neighbor_embeds.mean(axis=1).astype(np.float32)
-                chunk_res[f'embed_std_{k}'] = neighbor_embeds.std(axis=1).astype(np.float32)
+                # [PHASE 1: CANONICAL NAMING] embed_mean_{k}_d{dim}
+                # We store them as (N, 32) arrays, apply_latent_features will handle _d{dim} suffix
                 
-                k_dists = dist_matrix[row_idx, nn_indices]
+                mean_feat = neighbor_embeds.mean(axis=1).astype(np.float32)
+                std_feat = neighbor_embeds.std(axis=1).astype(np.float32)
+                
                 sim_scores = 1.0 - k_dists
                 weights = np.exp(sim_scores) / np.sum(np.exp(sim_scores), axis=1, keepdims=True)
-                chunk_res[f'weighted_mean_{k}'] = np.sum(weights[:, :, None] * neighbor_embeds, axis=1).astype(np.float32)
+                weighted_mean_feat = np.sum(weights[:, :, None] * neighbor_embeds, axis=1).astype(np.float32)
                 
-                # [FIX: KEYERROR] Ensure all patterns from LATENT_PATTERNS are generated for each k
-                # Dimension: (N, Dim) where Dim=32. SSOT expects f"{pattern}_{k}_d{d}"
-                # We store them in chunk_res with the base pattern name
-                chunk_res[f'embed_mean_{k}'] = neighbor_embeds.mean(axis=1).astype(np.float32)
-                chunk_res[f'embed_std_{k}'] = neighbor_embeds.std(axis=1).astype(np.float32)
+                # Store in final_results (concatenate later)
+                if f'embed_mean_{k}' not in final_results: final_results[f'embed_mean_{k}'] = []
+                if f'embed_std_{k}' not in final_results: final_results[f'embed_std_{k}'] = []
+                if f'weighted_mean_{k}' not in final_results: final_results[f'weighted_mean_{k}'] = []
+                if f'trend_proxy_{k}' not in final_results: final_results[f'trend_proxy_{k}'] = []
+                if f'volatility_proxy_{k}' not in final_results: final_results[f'volatility_proxy_{k}'] = []
                 
-                # [CONTRACT_TRACE]
-                logger.debug(f"[DIM_TRACE] neighbor_embeds: {neighbor_embeds.shape} | k: {k}")
-                
-                k_dists = dist_matrix[row_idx, nn_indices]
-                sim_scores = 1.0 - k_dists
-                weights = np.exp(sim_scores) / np.sum(np.exp(sim_scores), axis=1, keepdims=True)
-                chunk_res[f'weighted_mean_{k}'] = np.sum(weights[:, :, None] * neighbor_embeds, axis=1).astype(np.float32)
-                
-                chunk_res[f'trend_proxy_{k}'] = (chunk_res[f'embed_mean_{k}'] - t_embed).astype(np.float32)
-                chunk_res[f'volatility_proxy_{k}'] = chunk_res[f'embed_std_{k}'].copy() # Copy to avoid shared reference
+                final_results[f'embed_mean_{k}'].append(mean_feat)
+                final_results[f'embed_std_{k}'].append(std_feat)
+                final_results[f'weighted_mean_{k}'].append(weighted_mean_feat)
+                final_results[f'trend_proxy_{k}'].append((mean_feat - t_embed).astype(np.float32))
+                final_results[f'volatility_proxy_{k}'].append(std_feat)
 
-            # [ROOT_CAUSE_REMOVAL] Disable explicit np.newaxis or dimension fixing
-            chunk_res['regime_proxy'] = self.kmeans.predict(t_embed.astype(np.float64)).astype(np.float32)
-            avg_dist_20 = dist_matrix[row_idx, nn_indices_all[:, :20]].mean(axis=1)
-            chunk_res['local_density'] = (1.0 / (avg_dist_20 + 1e-6)).astype(np.float32)
-            chunk_res['similarity_entropy'] = (-np.sum(weights * np.log(weights + 1e-8), axis=1)).astype(np.float32)
+            # Global features (not k-dependent or fixed k)
+            if 'regime_proxy' not in final_results: final_results['regime_proxy'] = []
+            if 'local_density' not in final_results: final_results['local_density'] = []
+            if 'similarity_entropy' not in final_results: final_results['similarity_entropy'] = []
             
-            results_list.append(chunk_res)
+            final_results['regime_proxy'].append(self.kmeans.predict(t_embed.astype(np.float64)).astype(np.float32))
+            
+            # Use k=20 for local density as a stable reference
+            avg_dist_20 = final_dists[:, :20].mean(axis=1) if search_k >= 20 else final_dists.mean(axis=1)
+            final_results['local_density'].append((1.0 / (avg_dist_20 + 1e-6)).astype(np.float32))
+            
+            # Entropy for max k
+            sim_scores_max = 1.0 - final_dists
+            weights_max = np.exp(sim_scores_max) / np.sum(np.exp(sim_scores_max), axis=1, keepdims=True)
+            final_results['similarity_entropy'].append((-np.sum(weights_max * np.log(weights_max + 1e-8), axis=1)).astype(np.float32))
             
             # [MEMORY_OPTIMIZATION] Explicit deletion and GC
-            del dist_matrix, nn_indices_all, top_dists, sort_idx, weights
+            del dist_matrix, nn_indices_all, top_dists, sort_idx, weights_max
             if i % (chunk_size * 5) == 0:
                 gc.collect()
 
-        # 4. Final Reconstruction (Concatenate Chunks)
-        final_results = {}
-        if results_list:
-            for key in results_list[0].keys():
-                final_results[key] = np.concatenate([c[key] for c in results_list], axis=0)
+        # 5. Final Reconstruction (Concatenate Chunks)
+        concatenated_results = {}
+        for key in final_results.keys():
+            concatenated_results[key] = np.concatenate(final_results[key], axis=0)
             
-        return final_results
+        return concatenated_results
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [PHASE 3: DATA FLOW ALIGNMENT]
@@ -251,7 +330,7 @@ def build_base_features(df):
     logger.info(f"[BUILD_BASE] Output shape: {df.shape}")
     return df
 
-def apply_latent_features(df, reconstructor, scaler=None, selected_features=None):
+def apply_latent_features(df, reconstructor, scaler=None, selected_features=None, is_train=False):
     """
     [PHASE 2: FOLD-AWARE LATENT FEATURES]
     Applies fitted reconstructor and scaler to the dataframe.
@@ -259,19 +338,14 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
     """
     df = df.copy()
     
-    # 0. Initialize expected features to zero (Contract Enforcement)
-    # [MEMORY_OPTIMIZATION] Only initialize what's needed
+    # 0. Initialize expected features (Contract Enforcement)
     all_schema_features = selected_features if selected_features is not None else FEATURE_SCHEMA['all_features']
     existing_cols = set(df.columns)
-    new_cols_to_add = [c for c in all_schema_features if c not in existing_cols]
     
-    # [STABILITY] Explicit check for BASE columns required for embeddings (v18.5)
+    # [PHASE 1: HARD CHECK] RAISE ERROR IF EXPECTED FEATURES MISSING
     missing_base = [c for c in Config.EMBED_BASE_COLS if c not in existing_cols]
     if missing_base:
-        logger.warning(f"[RELIABILITY_ISSUE] Missing {len(missing_base)} base columns for embeddings: {missing_base}. Filling with 0.0.")
-    
-    if new_cols_to_add:
-        df = pd.concat([df, pd.DataFrame(0.0, index=df.index, columns=new_cols_to_add, dtype='float32')], axis=1)
+        raise RuntimeError(f"[SCHEMA_VIOLATION] Missing {len(missing_base)} base columns for embeddings: {missing_base}. NO SILENT FALLBACK ALLOWED.")
     
     # 1. Apply Drift Shield (if provided)
     if scaler is not None:
@@ -284,8 +358,8 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
         raise RuntimeError("[LEAKAGE GUARD] Cache missing. Reconstructor must be loaded from a pre-fitted train artifact.")
     
     # [OPTIMIZATION] Process entire dataframe at once (Internal chunking handles memory)
-    # This avoids redundant layout-based looping and slow .loc assignments
-    latent_stats = reconstructor.calculate_graph_stats(df)
+    # [PHASE 3: EXCLUDE SELF] Pass is_train flag
+    latent_stats = reconstructor.calculate_graph_stats(df, is_train=is_train)
     
     new_features_df_dict = {}
     for feat_name, values in latent_stats.items():
@@ -295,33 +369,47 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
             if values.shape[1] > 1:
                 for d in range(values.shape[1]):
                     col_name = f"{feat_name}_d{d}"
-                    if col_name in existing_cols or col_name in new_cols_to_add:
+                    if col_name in all_schema_features:
                         new_features_df_dict[col_name] = values[:, d].astype('float32')
             else:
                 # (N, 1) case - regime_proxy, local_density, etc.
-                # [EXCEPTION] If SSOT expects _d suffix even for (N, 1) latent features
                 col_name_d0 = f"{feat_name}_d0"
-                if col_name_d0 in existing_cols or col_name_d0 in new_cols_to_add:
+                if col_name_d0 in all_schema_features:
                     new_features_df_dict[col_name_d0] = values.ravel().astype('float32')
-                elif feat_name in existing_cols or feat_name in new_cols_to_add:
+                elif feat_name in all_schema_features:
                     new_features_df_dict[feat_name] = values.ravel().astype('float32')
         else:
             col_name = feat_name
-            if col_name in existing_cols or col_name in new_cols_to_add:
+            if col_name in all_schema_features:
                 val_flat = values.ravel() if isinstance(values, np.ndarray) else values
                 new_features_df_dict[col_name] = val_flat.astype('float32')
     
+    # [PHASE 1: HARD CHECK] Verify all expected features are present in new_features_df_dict or df
+    # [MISSION: ZERO SILENT FAILURE]
+    calculated_keys = set(new_features_df_dict.keys())
+    for f in all_schema_features:
+        if f in FEATURE_SCHEMA['embed_features'] and f not in calculated_keys:
+             # Check if it was already in df (unlikely for latent)
+             if f not in existing_cols:
+                raise RuntimeError(f"[SCHEMA_VIOLATION] Feature {f} expected but NOT generated by reconstructor. ABORTING.")
+
     # Efficiently update the dataframe
     if new_features_df_dict:
         new_feats_df = pd.DataFrame(new_features_df_dict, index=df.index)
-        # Update only the columns that were actually calculated
-        df.update(new_feats_df)
+        # We don't use .update() because it might be slow or silent. 
+        # Since we initialized new_cols_to_add in previous version, now we just concat the new features.
+        # But wait, some might already exist. Let's be safe.
+        for col in new_feats_df.columns:
+            df[col] = new_feats_df[col]
         del new_feats_df; gc.collect()
                 
     return df
 
-def build_features(df, mode='raw', reconstructor=None, residuals=None, raw_preds=None):
-    """Legacy entry point for compatibility."""
+def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=None, raw_preds=None):
+    """Legacy entry point for compatibility.
+    
+    [PHASE 2: SSOT SCALING] Added scaler argument to ensure consistent scaling.
+    """
     df_base = build_base_features(df)
     
     # In legacy mode, we still use the global stats if available for 'raw'
@@ -332,6 +420,9 @@ def build_features(df, mode='raw', reconstructor=None, residuals=None, raw_preds
         df_base = GlobalStatStore.apply_drift_shield(df_base, stats, FEATURE_SCHEMA['raw_features'])
     
     if mode == 'full' and reconstructor is not None:
+        # Scale if scaler is provided
+        if scaler is not None:
+            df_base = scaler.transform(df_base, FEATURE_SCHEMA['raw_features'])
         df_base = apply_latent_features(df_base, reconstructor)
 
     all_schema_features = FEATURE_SCHEMA['all_features']
@@ -396,6 +487,27 @@ def add_extreme_detection_features(df):
     # Early Warning
     new_features['early_warning_flag'] = ((new_features['order_inflow_15m_accel'] > 0) & (new_features['robot_utilization_rel_to_mean_5'] > 1.2)).astype(int)
     new_features['early_warning_score'] = new_features['order_inflow_15m_rel_to_mean_5'] + new_features['robot_utilization_rel_to_mean_5']
+
+    # [PART 4: EXTREME VALUE SEMANTIC RESTORATION]
+    # Detect extreme threshold: use 95th percentile of order_inflow_15m
+    threshold = df['order_inflow_15m'].quantile(0.95)
+    df['is_extreme'] = (df['order_inflow_15m'] >= threshold).astype(np.int8)
+    
+    # [MISSION: FINAL EDGE BOOST] Multi-feature extreme detection
+    key_extreme_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'near_collision_15m']
+    extreme_masks = []
+    for c in key_extreme_cols:
+        if c in df.columns:
+            q95 = df[c].quantile(0.95)
+            extreme_masks.append(df[c] >= q95)
+    
+    if extreme_masks:
+        df['is_extreme_multi'] = np.logical_or.reduce(extreme_masks).astype(np.int8)
+    else:
+        df['is_extreme_multi'] = df['is_extreme']
+        
+    coverage = df['is_extreme_multi'].mean()
+    logger.info(f"[EXTREME_INTELLIGENCE] Threshold (P95): {threshold:.4f} | Coverage: {coverage:.2%}")
 
     return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
 

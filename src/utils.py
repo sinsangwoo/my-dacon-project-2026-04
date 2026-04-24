@@ -555,6 +555,7 @@ class DriftShieldScaler:
     """
     def __init__(self):
         self.stats = {}
+        self.clipping_ratios = {}
         self.logger = logging.getLogger("DriftShieldScaler")
 
     def fit(self, df, feature_cols):
@@ -587,20 +588,36 @@ class DriftShieldScaler:
             s = self.stats[col]
             x = df[col].values.astype(np.float32)
             
-            # [RELIABILITY_FIX] Handle Infs and NaNs in transform (v18.5)
-            x = np.where(np.isinf(x), s['mean'], x) # Replace inf with mean
-            x = np.where(np.isnan(x), s['mean'], x) # Replace nan with mean
+            # [PHASE 6: EXTREME VALUE PRESERVATION]
+            # Replace Inf with large finite values
+            x = np.nan_to_num(x, nan=s['mean'], posinf=s['p99'], neginf=s['p1'])
             
-            # 1. Clip
+            # 1. Clip (Preserve original scale but bound outliers)
+            clipped_mask = (x > s['p99']) | (x < s['p1'])
+            n_clipped = np.sum(clipped_mask)
+            clip_pct = n_clipped / len(x)
+            
+            self.clipping_ratios[col] = clip_pct
+            
+            if clip_pct > 0.05:
+                self.logger.warning(f"[CLIPPING_MONITOR] High clipping: {col}={clip_pct:.2%}")
+            
             x = np.clip(x, s['p1'], s['p99'])
-            # 2. Normalize
-            x = (x - s['mean']) / (s['std'] + 1e-6)
-            # 3. Suppress
-            mask = np.abs(x) > 5
-            if mask.any():
-                x[mask] = np.sign(x[mask]) * (5.0 + np.log1p(np.abs(x[mask]) - 5.0))
+            
+            # [PHASE 5: VARIANCE RESTORATION]
+            # We NO LONGER normalize here. Normalization is a separate responsibility.
+            # We NO LONGER soft-clip (log suppression) here.
+            
+            # [PHASE 5: ASSERT REAL VARIANCE]
+            std_after = np.std(x) + 1e-9
+            # Since we no longer normalize, std_after should be close to std_before (s['std'])
+            ratio = std_after / (s['std'] + 1e-9)
+            
+            if ratio < 0.6:
+                self.logger.error(f"!!! [VARIANCE_COMPRESSION] {col} ratio={ratio:.4f} !!!")
             
             df[col] = x
+        return df
         return df
 
     def save(self, path):
@@ -899,3 +916,36 @@ class PhaseTracer:
         else:
             self.logger.info(f"[PHASE_END] {self.phase} | Duration: {duration:.2f}s | Status: SUCCESS\n{'='*50}\n")
             return True
+
+def run_integrity_audit(df, label="DATA"):
+    """
+    [MISSION: FINAL EDGE BOOST] Duplicate & Near-Zero Distance Detection
+    """
+    logger = logging.getLogger("INTEGRITY_AUDIT")
+    logger.info(f"--- [INTEGRITY_AUDIT] {label} ---")
+    
+    # 1. Identical Rows
+    n_duplicates = df.duplicated().sum()
+    if n_duplicates > 0:
+        logger.warning(f"[INTEGRITY_RISK] Found {n_duplicates} identical rows!")
+    else:
+        logger.info("[INTEGRITY_OK] No identical rows detected.")
+        
+    # 2. Near-Zero Distance Pairs (Sub-sampling for performance if large)
+    # We use a heuristic: check if any row has multiple occurrences in a rounded/binned space
+    # This is a proxy for "very near" without computing O(N^2) distances
+    rounded_df = df.select_dtypes(include=np.number).round(6)
+    n_near_duplicates = rounded_df.duplicated().sum()
+    
+    if n_near_duplicates > n_duplicates:
+        risk = n_near_duplicates - n_duplicates
+        logger.warning(f"[INTEGRITY_RISK] Found {risk} near-zero distance pairs (6-decimal match)!")
+    
+    logger.info(f"Duplicate Rows: {n_duplicates} | Near-Zero Pairs: {n_near_duplicates}")
+    logger.info(f"--- [/INTEGRITY_AUDIT] ---")
+    
+    return {
+        "duplicates": int(n_duplicates),
+        "near_duplicates": int(n_near_duplicates),
+        "risk_status": "HIGH" if n_near_duplicates > 0 else "SAFE"
+    }

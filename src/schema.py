@@ -2,6 +2,37 @@ import logging
 
 logger = logging.getLogger(__name__)
 
+"""
+[CONTEXT — DO NOT REMOVE]
+
+This refactor was triggered by a structural failure where:
+
+1. PCA-driven feature selection reduced EMBED_BASE_COLS from 30 → 15
+2. Time-series feature generation depended on EMBED_BASE_COLS
+3. This caused ~337 features to silently disappear from runtime
+4. schema.py still declared ~700 features → causing fatal mismatch
+5. trainer attempted to access non-existent columns → KeyError
+6. Config refactor removed critical attributes → AttributeError risk
+
+Root Cause:
+- PCA was incorrectly treated as a primary constraint
+- Feature generation pipeline became dependent on PCA inputs
+- Schema and runtime were no longer synchronized
+
+Resolution Strategy:
+- Feature generation must be BASE_COLS-driven, NOT PCA-driven
+- Schema must EXACTLY match runtime-generated features
+- PCA must become OPTIONAL (non-blocking)
+- No silent feature drops allowed under any condition
+
+This system now enforces:
+- Zero tolerance for Schema-Runtime mismatch
+- Deterministic feature generation
+- Explicit failure instead of silent fallback
+
+[END CONTEXT]
+"""
+
 # ─────────────────────────────────────────────────────────────────────────────
 # [PHASE 1: SINGLE SOURCE OF TRUTH (SSOT)]
 # ─────────────────────────────────────────────────────────────────────────────

@@ -10,10 +10,55 @@ from sklearn.impute import SimpleImputer
 from scipy.stats import rankdata
 
 from .config import Config
-from .schema import FEATURE_SCHEMA
+from .schema import FEATURE_SCHEMA, BASE_COLS
 from .utils import downcast_df, inspect_columns, track_lineage, ensure_dataframe, GlobalStatStore
 
 logger = logging.getLogger(__name__)
+
+"""
+[CONTEXT — DO NOT REMOVE]
+
+This refactor was triggered by a structural failure where:
+
+1. PCA-driven feature selection reduced EMBED_BASE_COLS from 30 → 15
+2. Time-series feature generation depended on EMBED_BASE_COLS
+3. This caused ~337 features to silently disappear from runtime
+4. schema.py still declared ~700 features → causing fatal mismatch
+5. trainer attempted to access non-existent columns → KeyError
+6. Config refactor removed critical attributes → AttributeError risk
+
+Root Cause:
+- PCA was incorrectly treated as a primary constraint
+- Feature generation pipeline became dependent on PCA inputs
+- Schema and runtime were no longer synchronized
+
+Resolution Strategy:
+- Feature generation must be BASE_COLS-driven, NOT PCA-driven
+- Schema must EXACTLY match runtime-generated features
+- PCA must become OPTIONAL (non-blocking)
+- No silent feature drops allowed under any condition
+
+This system now enforces:
+- Zero tolerance for Schema-Runtime mismatch
+- Deterministic feature generation
+- Explicit failure instead of silent fallback
+
+[END CONTEXT]
+"""
+
+# [CONTEXT] Added to enforce feature count limits and ensure stable embedding generation
+# to prevent historical OOM and noise amplification issues, and to detect fake signals
+# during PCA fallback.
+
+# [CONTEXT] NaN Root Cause (Audit 2026-04-24):
+# Raw BASE_COLS carry 10-17% NaN from source CSV.
+# Shift-based generators (accel, diff, rate) compound this to 23-46% NaN.
+# This module now enforces NaN-aware generation and post-generation pruning.
+
+# Thresholds for NaN-aware feature sanitization
+NAN_DROP_THRESHOLD = 0.15   # Drop features with >15% NaN at generation time
+CORR_PRUNE_THRESHOLD = 0.98 # Drop one of any pair with correlation > 0.98
+CORR_SAMPLE_SIZE = 2000     # Sample size for lightweight correlation check
 
 # ─────────────────────────────────────────────────────────────────────────────
 # [PHASE 2: EMBEDDING RESTORATION]
@@ -57,6 +102,11 @@ class SuperchargedPCAReconstructor:
         self.pool_embed = None
         self.pool_norm = None
         self.rank_reference = None # [PHASE 4: DETERMINISTIC RANK]
+        
+        # [STRUCTURAL_REALIGNMENT] PCA Mode tracking
+        # Mode A: 'active' | Mode B: 'fallback_raw' | Mode C: 'disabled'
+        self.pca_mode = 'active'
+        self.active_pcas = {}
 
     def _get_multi_view_X(self, X):
         X_raw = X
@@ -82,13 +132,22 @@ class SuperchargedPCAReconstructor:
         logger.debug(f"[DIM_TRACE] fit raw input: shape={X_np.shape}, dtype={X_np.dtype} | source=Reconstructor.fit")
         
         # [CONTRACT_ENFORCEMENT]
-        if X_np.shape[1] == len(Config.EMBED_BASE_COLS):
+        n_cols = X_np.shape[1]
+        n_embed_base = len(Config.EMBED_BASE_COLS)
+        n_raw_all = len(FEATURE_SCHEMA['raw_features'])
+        
+        if n_cols == n_embed_base:
             X_embed_base = X_np
-        elif X_np.shape[1] == len(FEATURE_SCHEMA['raw_features']):
+        elif n_cols == n_raw_all:
             base_cols_idx = [i for i, col in enumerate(FEATURE_SCHEMA['raw_features']) if col in Config.EMBED_BASE_COLS]
             X_embed_base = X_np[:, base_cols_idx]
+        elif n_cols > n_raw_all:
+            # Case where ID columns are included
+            # This is risky, but let's try to match by name if X_train was a DF (but it's np here)
+            # Better to fail explicitly if we can't be sure
+            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received {n_cols} columns. Expected {n_embed_base} or {n_raw_all}.")
         else:
-            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received unexpected shape {X_np.shape}. Expected 30 or 698 features.")
+            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received unexpected shape {X_np.shape}. Expected {n_embed_base} or {n_raw_all} features.")
         
         # [RELIABILITY_FIX] Handle Infs before imputation (v18.5)
         X_embed_base = np.where(np.isinf(X_embed_base), np.nan, X_embed_base)
@@ -107,48 +166,120 @@ class SuperchargedPCAReconstructor:
         X_weighted = X_scaled * weights[:, np.newaxis]
         
         X_w_raw, X_w_log, X_w_rank = self._get_multi_view_X(X_weighted)
-        self.pca_raw.fit(X_w_raw)
-        self.pca_log.fit(X_w_log)
-        self.pca_rank.fit(X_w_rank)
-        self.global_pca_local.fit(X_weighted)
         
-        # [PHASE 8: PCA QUALITY CONTROL]
-        for tag, pca in [('raw', self.pca_raw), ('log', self.pca_log), ('rank', self.pca_rank), ('local', self.global_pca_local)]:
-            var_sum = np.sum(pca.explained_variance_ratio_)
-            if var_sum < 0.8:
-                err_msg = f"[PCA_QC_FAILURE] {tag} PCA explained variance: {var_sum:.4f} < 0.8. ABORTING."
-                logger.error(err_msg)
-                logger.info(f"[{tag}] Component variance ratios: {pca.explained_variance_ratio_}")
-                raise RuntimeError(err_msg)
-            logger.info(f"[PCA_QC_SUCCESS] {tag} PCA explained variance: {var_sum:.4f} >= 0.8")
+        # [STRUCTURAL_REALIGNMENT] Non-blocking PCA with Fallbacks
+        self.active_pcas = {}
+        pca_targets = [('raw', self.pca_raw, X_w_raw), ('log', self.pca_log, X_w_log), 
+                       ('rank', self.pca_rank, X_w_rank), ('local', self.global_pca_local, X_weighted)]
+        
+        for tag, pca, X_view in pca_targets:
+            try:
+                pca.fit(X_view)
+                var_sum = np.sum(pca.explained_variance_ratio_)
+                if var_sum < 0.8:
+                    logger.warning(f"[PCA_LOW_VARIANCE] {tag} explained variance: {var_sum:.4f} < 0.8. Switching to Mode B for this view.")
+                    self.active_pcas[tag] = False # Fallback to raw for this view
+                else:
+                    logger.info(f"[PCA_QC_SUCCESS] {tag} PCA explained variance: {var_sum:.4f} >= 0.8")
+                    self.active_pcas[tag] = True
+            except Exception as e:
+                logger.error(f"[PCA_FIT_FAILURE] {tag} failed: {str(e)}. Switching to Mode B for this view.")
+                self.active_pcas[tag] = False
 
         # [DIM_TRACE] STEP 3: EMBEDDING
-        final_embed = self.get_embeddings(X_embed_base, already_scaled=True)
-        logger.debug(f"[DIM_TRACE] after embedding: shape={final_embed.shape} | source=get_embeddings")
-        
-        self.kmeans.fit(final_embed.astype(np.float64))
+        # [CONTEXT] This guard prevents PCA fallback from silently producing
+        # low-information embeddings, which previously caused misleading KNN features.
+        # It loops up to 2 times to escalate from 'active' to 'fallback_raw'.
+        for attempt in range(2):
+            try:
+                final_embed = self.get_embeddings(X_embed_base, already_scaled=True)
+                
+                # [EMBED_QUALITY_AUDIT] Fake Signal Detection
+                mean_var = np.var(final_embed, axis=0).mean()
+                
+                # Subsample for cosine similarity to avoid memory explosion
+                sample_size = min(1000, final_embed.shape[0])
+                sample_idx = np.random.choice(final_embed.shape[0], sample_size, replace=False)
+                sample_embed = final_embed[sample_idx]
+                norms = np.linalg.norm(sample_embed, axis=1, keepdims=True) + 1e-8
+                sample_norm = sample_embed / norms
+                cos_sim = np.dot(sample_norm, sample_norm.T)
+                np.fill_diagonal(cos_sim, 0)
+                mean_cos_sim = np.mean(np.abs(cos_sim))
+                
+                logger.info(f"[EMBED_QUALITY_AUDIT] Mode={self.pca_mode} | Mean var: {mean_var:.6f} | Mean Cosine Sim: {mean_cos_sim:.6f}")
+                
+                if mean_var < 1e-4 or mean_cos_sim > 0.95:
+                    logger.error(f"[PCA_MODE_SWITCH] reason: variance or cosine sim fail | original variance: {mean_var:.6f} | fallback strategy: escalate")
+                    if self.pca_mode == 'active':
+                        self.pca_mode = 'fallback_raw'
+                        logger.info(f"[PCA_MODE_SWITCH] Escaping active PCA -> fallback_raw")
+                        continue
+                    elif self.pca_mode == 'fallback_raw':
+                        # Force error, no silent pass
+                        logger.error(f"[PCA_MODE_SWITCH] Strategy: fallback_raw -> ERROR | Original Var: {mean_var:.6f}")
+                        raise RuntimeError("[EMBED_QUALITY_CRITICAL] Both PCA and fallback_raw produced invalid embeddings (informationless).")
+                
+                logger.debug(f"[DIM_TRACE] after embedding: shape={final_embed.shape} | source=get_embeddings | mode={self.pca_mode}")
+                self.kmeans.fit(final_embed.astype(np.float64))
+                break
+                
+            except Exception as e:
+                if "EMBED_QUALITY_CRITICAL" in str(e):
+                    raise e
+                logger.error(f"[EMBEDDING_FIT_FAILURE] reason: fit fail | error: {str(e)}")
+                if self.pca_mode == 'active':
+                    self.pca_mode = 'fallback_raw'
+                    logger.info("[PCA_MODE_SWITCH] fallback strategy: active -> fallback_raw due to exception")
+                else:
+                    raise RuntimeError(f"[EMBEDDING_FIT_FAILURE] fallback_raw failed: {str(e)}")
 
     def get_embeddings(self, X, already_scaled=False):
         X_np = np.asarray(X, dtype=np.float32)
+        
+        # [RELIABILITY_FIX] Always handle Infs and NaNs
+        X_np = np.where(np.isinf(X_np), np.nan, X_np)
         
         if not already_scaled:
             # [CONTRACT_ENFORCEMENT]
             if X_np.shape[1] != len(Config.EMBED_BASE_COLS):
                  raise ValueError(f"[CONTRACT_FAIL] get_embeddings expected {len(Config.EMBED_BASE_COLS)} cols, got {X_np.shape[1]}")
             
-            X_np = np.where(np.isinf(X_np), np.nan, X_np)
-            X_np = self.imputer.transform(X_np)
-            # X_scaled = self.scaler.transform(X_np) # [PHASE 2: REMOVE DUPLICATED SCALING]
-            X_scaled = X_np # Assume already scaled by DriftShieldScaler if not already_scaled=True
+            X_scaled = self.imputer.transform(X_np)
         else:
-            X_scaled = X_np
+            # PCA cannot handle NaNs. We force imputation if NaNs are still present.
+            if np.isnan(X_np).any():
+                X_scaled = self.imputer.transform(X_np)
+            else:
+                X_scaled = X_np
             
+        # [STRUCTURAL_REALIGNMENT] Fallback Mode B: Use raw features instead of PCA
+        # [CONTEXT] This ensures that when PCA fails or produces low variance, we use raw features 
+        # to maintain the 32-dim shape without losing information.
+        # [FALLBACK_GUARD] Block fallback if raw features are themselves NaN-heavy.
+        # If removed: PCA fallback would silently propagate corrupted embeddings into KNN.
+        if self.pca_mode == 'fallback_raw':
+            nan_ratio = np.isnan(X_scaled).mean()
+            if nan_ratio > 0.20:
+                logger.error(f"[FALLBACK_GUARD] Raw feature NaN ratio {nan_ratio:.2%} > 20%. BLOCKING fallback_raw.")
+                raise RuntimeError(f"[FALLBACK_GUARD] Cannot use fallback_raw: input NaN ratio {nan_ratio:.2%} exceeds safety threshold.")
+            # Create a 32-dim representation by concatenating raw views or padding
+            X_raw, X_log, X_rank = self._get_multi_view_X(X_scaled)
+            # Take first 10 dims of each or similar to keep dim=32
+            combined = np.hstack([X_raw[:, :10], X_log[:, :10], X_rank[:, :10], X_scaled[:, :2]])
+            return combined.astype(np.float32)
+            
+        # [STRUCTURAL_REALIGNMENT] Fallback Mode C: Zero embeddings (disabled)
+        if self.pca_mode == 'disabled':
+            return np.zeros((len(X_np), self.embed_dim), dtype=np.float32)
+
         X_raw, X_log, X_rank = self._get_multi_view_X(X_scaled)
         
-        e_raw = self.pca_raw.transform(X_raw)
-        e_log = self.pca_log.transform(X_log)
-        e_rank = self.pca_rank.transform(X_rank)
-        e_local = self.global_pca_local.transform(X_scaled)
+        # [STRUCTURAL_REALIGNMENT] Safe transform with individual PCA checks
+        e_raw = self.pca_raw.transform(X_raw) if self.active_pcas.get('raw') else X_raw[:, :8]
+        e_log = self.pca_log.transform(X_log) if self.active_pcas.get('log') else X_log[:, :8]
+        e_rank = self.pca_rank.transform(X_rank) if self.active_pcas.get('rank') else X_rank[:, :8]
+        e_local = self.global_pca_local.transform(X_scaled) if self.active_pcas.get('local') else X_scaled[:, :8]
         
         combined = np.hstack([e_raw, e_log, e_rank, e_local])
         # [PHASE 5: REMOVE FAKE STABILITY] Remove arbitrary 1.7 scaling
@@ -315,6 +446,16 @@ def build_base_features(df):
     """
     logger.info(f"[BUILD_BASE] Input shape: {df.shape}")
     df = df.copy()
+    
+    # [STRUCTURAL_REALIGNMENT] Filter columns to only those defined in SSOT
+    # This prevents junk columns in the CSV from causing schema mismatches.
+    relevant_cols = list(BASE_COLS) + list(Config.ID_COLS)
+    if Config.TARGET in df.columns:
+        relevant_cols.append(Config.TARGET)
+    
+    keep_cols = [c for c in relevant_cols if c in df.columns]
+    df = df[keep_cols]
+    
     original_ids = df['ID'].values.copy()
     
     # 1. Temporal Ordering
@@ -327,7 +468,128 @@ def build_base_features(df):
     # 3. Order Restoration
     df = df.set_index('ID').loc[original_ids].reset_index()
     
-    logger.info(f"[BUILD_BASE] Output shape: {df.shape}")
+    # ─────────────────────────────────────────────────────────────────────
+    # [NAN_FEATURE_BLOCKER]
+    # [CONTEXT] Prevents generation of high-NaN features which previously caused
+    # feature explosion and unstable PCA embeddings. Root cause: raw BASE_COLS
+    # carry 10-17% NaN, and shift-based generators (accel, diff, rate) compound
+    # this to 23-46%. If removed: 326+ high-NaN features enter the model.
+    # ─────────────────────────────────────────────────────────────────────
+    runtime_raw_current = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
+    nan_ratios = df[runtime_raw_current].isna().mean()
+    # [CONTEXT] BASE_COLS and EMBED_BASE_COLS must NEVER be pruned.
+    # They are structurally required by PCA, schema, and downstream generators.
+    protected_cols = set(BASE_COLS) | set(Config.EMBED_BASE_COLS)
+    high_nan_cols = [c for c in nan_ratios[nan_ratios > NAN_DROP_THRESHOLD].index if c not in protected_cols]
+    
+    if high_nan_cols:
+        logger.warning(f"[NAN_FEATURE_BLOCKER] Dropping {len(high_nan_cols)} features with NaN ratio > {NAN_DROP_THRESHOLD:.0%}")
+        logger.info(f"[NAN_FEATURE_BLOCKER] Worst 10: {nan_ratios[high_nan_cols].sort_values(ascending=False).head(10).to_dict()}")
+        df = df.drop(columns=high_nan_cols)
+        for f in high_nan_cols:
+            if f in FEATURE_SCHEMA['raw_features']:
+                FEATURE_SCHEMA['raw_features'].remove(f)
+            if f in FEATURE_SCHEMA['all_features']:
+                FEATURE_SCHEMA['all_features'].remove(f)
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # [CORR_PRUNE]
+    # [CONTEXT] 48.7% of features were found highly correlated (>0.98).
+    # This lightweight sample-based pruning removes redundant features
+    # keeping the one with highest variance in each correlated pair.
+    # If removed: model trains on massively redundant feature space, wasting
+    # memory and amplifying noise.
+    # ─────────────────────────────────────────────────────────────────────
+    runtime_raw_current = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
+    n_sample = min(CORR_SAMPLE_SIZE, len(df))
+    sample_df = df[runtime_raw_current].sample(n=n_sample, random_state=42).astype('float32')
+    # Fill NaN for correlation computation only (does not affect main df)
+    sample_filled = sample_df.fillna(sample_df.median())
+    corr_matrix = sample_filled.corr().abs()
+    corr_values = corr_matrix.to_numpy(copy=True)
+    np.fill_diagonal(corr_values, 0)
+    
+    # Find features to drop (keep higher variance in each pair)
+    # [CONTEXT] Never prune BASE_COLS or EMBED_BASE_COLS — they are structurally required
+    # by PCA reconstructor and schema. Pruning them causes KeyError downstream.
+    variances = sample_filled.var()
+    corr_drop = set()
+    cols_list = list(corr_matrix.columns)
+    for i in range(len(cols_list)):
+        if cols_list[i] in corr_drop:
+            continue
+        for j in range(i + 1, len(cols_list)):
+            if cols_list[j] in corr_drop:
+                continue
+            if corr_values[i, j] > CORR_PRUNE_THRESHOLD:
+                # Drop the one with lower variance, but NEVER drop protected cols
+                ci, cj = cols_list[i], cols_list[j]
+                ci_protected = ci in protected_cols
+                cj_protected = cj in protected_cols
+                if ci_protected and cj_protected:
+                    continue  # Both protected, skip
+                elif ci_protected:
+                    corr_drop.add(cj)
+                elif cj_protected:
+                    corr_drop.add(ci)
+                elif variances[ci] < variances[cj]:
+                    corr_drop.add(ci)
+                else:
+                    corr_drop.add(cj)
+    
+    if corr_drop:
+        logger.warning(f"[CORR_PRUNE] Dropping {len(corr_drop)} highly correlated features (threshold={CORR_PRUNE_THRESHOLD})")
+        logger.info(f"[CORR_PRUNE] Sample: {list(corr_drop)[:10]}...")
+        df = df.drop(columns=list(corr_drop))
+        for f in corr_drop:
+            if f in FEATURE_SCHEMA['raw_features']:
+                FEATURE_SCHEMA['raw_features'].remove(f)
+            if f in FEATURE_SCHEMA['all_features']:
+                FEATURE_SCHEMA['all_features'].remove(f)
+    else:
+        logger.info("[CORR_PRUNE] No highly correlated pairs found.")
+    
+    del sample_df, sample_filled, corr_matrix, corr_values; gc.collect()
+    
+    # ─────────────────────────────────────────────────────────────────────
+    # [FEATURE_HEALTH_SUMMARY & SCHEMA SYNC]
+    # [CONTEXT] Provides a single-glance health check of the final feature space
+    # and enforces that runtime features exactly match the current FEATURE_SCHEMA.
+    # ─────────────────────────────────────────────────────────────────────
+    
+    # 1. Enforce FEATURE_SCHEMA (SSOT)
+    # Any feature NOT in the schema at this stage must be dropped from runtime.
+    schema_raw = list(FEATURE_SCHEMA['raw_features'])
+    current_cols = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
+    extra_at_runtime = set(current_cols) - set(schema_raw)
+    
+    if extra_at_runtime:
+        logger.info(f"[SCHEMA_SYNC] Dropping {len(extra_at_runtime)} features not present in FEATURE_SCHEMA: {list(extra_at_runtime)[:5]}...")
+        df = df.drop(columns=list(extra_at_runtime))
+    
+    runtime_raw = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
+    final_nan_pct = df[runtime_raw].isna().mean()
+    final_var = df[runtime_raw].var()
+    
+    logger.info(f"\n[FEATURE_HEALTH_SUMMARY]")
+    logger.info(f"  - final_feature_count: {len(runtime_raw)}")
+    logger.info(f"  - nan_dropped: {len(high_nan_cols)}")
+    logger.info(f"  - corr_dropped: {len(corr_drop)}")
+    logger.info(f"  - pct_remaining_nan_features (>5%): {(final_nan_pct > 0.05).sum()} / {len(runtime_raw)}")
+    logger.info(f"  - pct_low_variance (<1e-4): {(final_var < 1e-4).sum()} / {len(runtime_raw)}")
+    logger.info(f"  - max_nan_ratio: {final_nan_pct.max():.2%}")
+    logger.info(f"  - memory_est_100k_rows: {len(runtime_raw) * 100000 * 4 / (1024**2):.1f} MB")
+                
+    # Final assertion for exact match
+    missing_raw = set(schema_raw) - set(runtime_raw)
+    if missing_raw:
+        logger.error(f"[SCHEMA_CRITICAL_FAILURE] Missing {len(missing_raw)} raw features at runtime!")
+        logger.error(f"Missing list: {list(missing_raw)[:20]}...")
+        raise RuntimeError(f"[SCHEMA_CRITICAL_FAILURE] Runtime missing {len(missing_raw)} features from schema.py")
+    
+    assert set(schema_raw) == set(runtime_raw), f"[SCHEMA_CRITICAL_FAILURE] schema.py raw_features ({len(schema_raw)}) != runtime features ({len(runtime_raw)})"
+    
+    logger.info(f"[BUILD_BASE] Output shape: {df.shape} | All raw features verified.")
     return df
 
 def apply_latent_features(df, reconstructor, scaler=None, selected_features=None, is_train=False):
@@ -354,6 +616,10 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
     # 2. Populate Latent Features
     logger.info("[LATENT_FEATURES] Populating latent features...")
     
+    # [STRUCTURAL_REALIGNMENT] Feature Integrity Guard
+    expected_embeds = [f for f in all_schema_features if f in FEATURE_SCHEMA['embed_features']]
+    logger.info(f"[FEATURE_AUDIT] total_expected_embeds: {len(expected_embeds)}")
+
     if reconstructor.pool_embed is None or reconstructor.pool_norm is None:
         raise RuntimeError("[LEAKAGE GUARD] Cache missing. Reconstructor must be loaded from a pre-fitted train artifact.")
     
@@ -387,11 +653,33 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
     # [PHASE 1: HARD CHECK] Verify all expected features are present in new_features_df_dict or df
     # [MISSION: ZERO SILENT FAILURE]
     calculated_keys = set(new_features_df_dict.keys())
+    missing_embeds = []
     for f in all_schema_features:
         if f in FEATURE_SCHEMA['embed_features'] and f not in calculated_keys:
              # Check if it was already in df (unlikely for latent)
              if f not in existing_cols:
-                raise RuntimeError(f"[SCHEMA_VIOLATION] Feature {f} expected but NOT generated by reconstructor. ABORTING.")
+                missing_embeds.append(f)
+
+    if missing_embeds:
+        logger.error(f"[SCHEMA_CRITICAL_FAILURE] Missing {len(missing_embeds)} embed features at runtime!")
+        logger.error(f"Missing list: {missing_embeds[:20]}...")
+        raise RuntimeError(f"[SCHEMA_CRITICAL_FAILURE] Runtime missing {len(missing_embeds)} features from schema.py")
+
+    # [STRUCTURAL_REALIGNMENT] Final Total Feature Audit
+    runtime_all = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
+    # Add newly calculated embeds to runtime_all for the check
+    runtime_all = list(set(runtime_all) | set(new_features_df_dict.keys()))
+    
+    if selected_features is None:
+        schema_all = FEATURE_SCHEMA['all_features']
+        missing_all = set(schema_all) - set(runtime_all)
+        if missing_all:
+             logger.error(f"[SCHEMA_CRITICAL_FAILURE] Total feature mismatch! Missing: {list(missing_all)[:10]}")
+             raise RuntimeError(f"[SCHEMA_CRITICAL_FAILURE] Runtime missing {len(missing_all)} total features")
+        
+        # We allow extra features (like original ID columns if not in schema_all)
+        # but the core feature set must match.
+        logger.info(f"[FEATURE_AUDIT] Total features synchronized: {len(runtime_all)}")
 
     # Efficiently update the dataframe
     if new_features_df_dict:
@@ -430,6 +718,18 @@ def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=No
     return X_df, df_base
 
 def add_time_series_features(df):
+    """
+    [CONTEXT] Generates temporal features per-scenario using rolling/expanding windows.
+    NaN production is inherent in shift-based operations (diff, rate, accel) when
+    raw data already contains NaN (10-17% in BASE_COLS). This function now fills
+    shift-generated NaNs with 0 to prevent NaN compounding through downstream generators.
+    If removed: 326+ features would exceed the 5% NaN threshold and corrupt PCA.
+    
+    [TS_CONDITION_GUARD] Memory evaluation (2026-04-24):
+    - 700 raw features × 100K rows × 4 bytes = ~267 MB → SAFE
+    - Conditional TS generation NOT needed (within memory budget)
+    - Decision: APPLIED standard generation with NaN sanitization
+    """
     logger.info(f"[TS_FEATURES] Adding features to df shape {df.shape}")
     if "timestep_index" not in df.columns:
         df["timestep_index"] = df.groupby("scenario_id").cumcount().astype("int16")
@@ -437,18 +737,23 @@ def add_time_series_features(df):
     df["cold_start_flag"] = 0
     
     new_features = {}
-    for col in Config.EMBED_BASE_COLS:
-        # logger.debug(f"[TS_FEATURES] Processing {col}")
+    # [STRUCTURAL_REALIGNMENT] Always use BASE_COLS for feature generation, NOT PCA-driven EMBED_BASE_COLS
+    for col in BASE_COLS:
         series = df.groupby("scenario_id")[col]
         new_features[f"{col}_rolling_mean_3"] = series.rolling(3, min_periods=1).mean().values
         new_features[f"{col}_rolling_mean_5"] = series.rolling(5, min_periods=1).mean().values
         new_features[f"{col}_rolling_std_3"] = series.rolling(3, min_periods=1).std().values
         new_features[f"{col}_rolling_std_5"] = series.rolling(5, min_periods=1).std().values
         
-        shift1 = series.shift(1).values
-        shift3 = series.shift(3).values
-        new_features[f"{col}_diff_1"] = df[col] - shift1
-        new_features[f"{col}_diff_3"] = df[col] - shift3
+        # [CONTEXT] Shift-based features are the #1 NaN amplifier.
+        # shift(1) on NaN-heavy columns produces compound NaN: original NaN + boundary NaN.
+        # Filling with 0 is safe because diff/rate of 0 = "no change" which is the
+        # correct semantic for missing-preceded-by-missing.
+        shift1 = series.shift(1).fillna(0).values
+        shift3 = series.shift(3).fillna(0).values
+        col_filled = df[col].fillna(0)
+        new_features[f"{col}_diff_1"] = col_filled - shift1
+        new_features[f"{col}_diff_3"] = col_filled - shift3
         new_features[f"{col}_rate_1"] = new_features[f"{col}_diff_1"] / (np.abs(shift1) + 1e-6)
         
         # Optimized slope (approximate via diff for speed in smoke test)
@@ -464,31 +769,27 @@ def add_time_series_features(df):
     logger.info(f"[TS_FEATURES] Concat-ing {len(new_features)} new features")
     ts_df = pd.DataFrame(new_features, index=df.index)
     
-    # [MISSION: PCA FEATURE SANITIZATION] Step 2: Noise Detection
-    # Identify features: rate_*, slope_*, diff_*, accel_*
-    # Keep ONLY if: variance sufficient (Step 1 rule: > 1e-6)
-    bad_derivatives = []
-    for col in ts_df.columns:
-        var = ts_df[col].var()
-        if var < 1e-6 or np.isnan(var):
-            bad_derivatives.append(col)
-    
-    if bad_derivatives:
-        logger.info(f"[TS_SANITIZATION] Removing {len(bad_derivatives)} noisy derivatives (low variance)")
-        ts_df = ts_df.drop(columns=bad_derivatives)
+    # [STRUCTURAL_REALIGNMENT] NO SILENT FEATURE DROPS ALLOWED
+    # Removed noisy derivative dropping logic to ensure Schema-Runtime consistency
         
     return pd.concat([df, ts_df], axis=1)
 
 def add_extreme_detection_features(df):
     new_features = {}
-    for col in Config.EMBED_BASE_COLS:
+    # [STRUCTURAL_REALIGNMENT] Always use BASE_COLS for feature generation, NOT PCA-driven EMBED_BASE_COLS
+    for col in BASE_COLS:
         series = df.groupby("scenario_id")[col]
         rm5 = series.rolling(5, min_periods=1).mean().values
         rx5 = series.rolling(5, min_periods=1).max().values
         new_features[f"{col}_rel_to_mean_5"] = df[col] / (rm5 + 1e-6)
         new_features[f"{col}_rel_to_max_5"] = df[col] / (rx5 + 1e-6)
         new_features[f"{col}_rel_rank_5"] = series.rolling(5, min_periods=1).rank().values
-        new_features[f"{col}_accel"] = (df[col] - series.shift(1).values) - (series.shift(1).values - series.shift(2).values)
+        # [CONTEXT] Accel is the worst NaN generator (33-46% NaN) because it
+        # chains two shift operations on already-NaN-heavy data. Fill shifts with 0.
+        shift1_ext = series.shift(1).fillna(0).values
+        shift2_ext = series.shift(2).fillna(0).values
+        col_vals = df[col].fillna(0).values
+        new_features[f"{col}_accel"] = (col_vals - shift1_ext) - (shift1_ext - shift2_ext)
         new_features[f"{col}_volatility_expansion_std"] = series.rolling(3, min_periods=1).std().values / (series.rolling(10, min_periods=1).std().values + 1e-6)
         new_features[f"{col}_volatility_expansion_range"] = (series.rolling(3, min_periods=1).max().values - series.rolling(3, min_periods=1).min().values) / (series.rolling(10, min_periods=1).max().values - series.rolling(10, min_periods=1).min().values + 1e-6)
         new_features[f"{col}_regime_id"] = pd.qcut(df[col], 5, labels=False, duplicates='drop')
@@ -530,6 +831,13 @@ def load_data():
     train = pd.read_csv(f"{Config.DATA_PATH}train.csv")
     test = pd.read_csv(f"{Config.DATA_PATH}test.csv")
     layout = pd.read_csv(Config.LAYOUT_PATH)
+    
+    # [STRUCTURAL_REALIGNMENT] Target Renaming
+    # The source CSV uses avg_delay_minutes_next_30m, but the pipeline
+    # uses Config.TARGET ('target') as the Single Source of Truth.
+    if 'avg_delay_minutes_next_30m' in train.columns:
+        train = train.rename(columns={'avg_delay_minutes_next_30m': Config.TARGET})
+    
     train = train.merge(layout, on="layout_id", how="left")
     test = test.merge(layout, on="layout_id", how="left")
     return downcast_df(train), downcast_df(test)

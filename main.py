@@ -261,9 +261,12 @@ def main():
     parser.add_argument("--mode", type=str, default="full")
     parser.add_argument("--smoke-test", action="store_true")
     parser.add_argument("--force", action="store_true")
+    parser.add_argument("--run-id", type=str, default=None)
     args = parser.parse_args()
     
     Config.FORCE_OVERWRITE = args.force
+    if args.run_id:
+        Config.rebuild_paths(args.run_id)
     
     if args.phase == 'all':
         for p in VALID_PHASES:

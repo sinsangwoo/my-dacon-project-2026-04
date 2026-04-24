@@ -109,7 +109,7 @@ def run_phase(phase, mode, smoke_test=False):
             log_forensic_snapshot(train, "train_raw", logger)
             log_forensic_snapshot(test, "test_raw", logger)
             
-        elif phase in ['2_build_base', '2_build_raw']:
+        elif phase == '2_build_base':
             train, test = load_data()
             if smoke_test:
                 train = train.head(Config.SMOKE_ROWS); test = test.head(Config.SMOKE_ROWS)
@@ -169,7 +169,7 @@ def run_phase(phase, mode, smoke_test=False):
             save_npy(oof, f'{Config.PROCESSED_PATH}/oof_raw.npy')
             save_npy(y - oof, f'{Config.PROCESSED_PATH}/residuals_raw.npy')
 
-        elif phase in ['5_train_leakage_free', '5_train_final']:
+        elif phase == '5_train_leakage_free':
             from src.utils import assert_artifact_exists
             assert_artifact_exists(f'{Config.PROCESSED_PATH}/train_base.pkl', "Train Base Features")
             assert_artifact_exists(f'{Config.PROCESSED_PATH}/y_train.npy', "Train Labels")

@@ -10,8 +10,8 @@ logger = logging.getLogger(__name__)
 BASE_COLS = [
     'order_inflow_15m', 'unique_sku_15m', 'avg_items_per_order', 'urgent_order_ratio',
     'heavy_item_ratio', 'cold_chain_ratio', 'sku_concentration', 'robot_active',
-    'robot_idle', 'robot_charging', 'robot_utilization', 'avg_trip_distance',
-    'task_reassign_15m', 'battery_std', 'low_battery_ratio', 'charge_queue_length',
+    'robot_idle', 'robot_charging', 'robot_utilization', 'avg_trip_distance', 'task_reassign_15m',
+    'battery_std', 'low_battery_ratio', 'charge_queue_length',
     'avg_charge_wait', 'congestion_score', 'max_zone_density', 'blocked_path_15m',
     'near_collision_15m', 'fault_count_15m', 'avg_recovery_time', 'replenishment_overlap',
     'pack_utilization', 'manual_override_ratio', 'warehouse_temp_avg', 'humidity_pct',

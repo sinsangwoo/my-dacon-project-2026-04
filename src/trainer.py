@@ -109,7 +109,9 @@ class Trainer:
             logger.info(f"[CLIPPING_MONITOR] Top clipped: {sorted_clips[:5]}")
             
             # Fit reconstructor on scaled base cols
-            reconstructor.fit(tr_df_scaled_all[Config.EMBED_BASE_COLS].values)
+            # [PHASE 8: PCA QUALITY CONTROL]
+            # Use decoupled PCA_INPUT_COLS to ensure 0.8 explained variance
+            reconstructor.fit(tr_df_scaled_all[Config.PCA_INPUT_COLS].values)
             # Build cache using scaled data
             reconstructor.build_fold_cache(tr_df_scaled_all)
             

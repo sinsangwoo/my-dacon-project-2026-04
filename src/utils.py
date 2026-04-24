@@ -374,19 +374,21 @@ def run_adversarial_validation(X_train, X_val, groups=None):
     
     return auc
 
-def generate_pseudo_test_set(X, y):
+def generate_pseudo_test_set(X, y, seed=42):
     """
     PURPOSE: [PHASE 3: PSEUDO TEST SIMULATION]
     Simulate a harder test set by adding noise and scaling features.
     """
     X_pseudo = X.copy()
+    # [DETERMINISM_FIX] Use local RandomState to avoid global state pollution
+    rng = np.random.RandomState(seed)
     
     # Apply 10% noise to all features
-    noise = np.random.normal(0, 0.1, X.shape).astype(np.float32)
+    noise = rng.normal(0, 0.1, X.shape).astype(np.float32)
     X_pseudo += noise
     
     # Randomly scale top 20% of samples by 1.2x (Simulate extreme regime)
-    scale_mask = np.random.choice([0, 1], size=len(X), p=[0.8, 0.2]).astype(bool)
+    scale_mask = rng.choice([0, 1], size=len(X), p=[0.8, 0.2]).astype(bool)
     X_pseudo[scale_mask] *= 1.2
     
     return X_pseudo, y
@@ -545,9 +547,23 @@ def ensure_dataframe(X, feature_names=None, tag="UNKNOWN"):
     return X
 
 def seed_everything(seed=42):
+    """
+    [MISSION: FULL DETERMINISM] Consolidates all RNG control points.
+    """
+    import random
     random.seed(seed)
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
+    # Ensure any environment-level randomness is locked
+    try:
+        import torch
+        torch.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+    except ImportError:
+        pass
+    
+    # LGBM and others usually take random_state in params, 
+    # but global seed is a fallback.
 
 class DriftShieldScaler:
     """Stateful, fold-aware distribution controller (v15.0).

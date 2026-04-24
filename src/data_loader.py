@@ -113,14 +113,14 @@ class SuperchargedPCAReconstructor:
         self.global_pca_local.fit(X_weighted)
         
         # [PHASE 8: PCA QUALITY CONTROL]
-        for name, pca in [('raw', self.pca_raw), ('log', self.pca_log), ('rank', self.pca_rank), ('local', self.global_pca_local)]:
-            var_ratio = np.sum(pca.explained_variance_ratio_)
-            if var_ratio < 0.8:
-                err_msg = f"[PCA_QC_FAILURE] {name} PCA explained variance: {var_ratio:.4f} < 0.8. ABORTING."
+        for tag, pca in [('raw', self.pca_raw), ('log', self.pca_log), ('rank', self.pca_rank), ('local', self.global_pca_local)]:
+            var_sum = np.sum(pca.explained_variance_ratio_)
+            if var_sum < 0.8:
+                err_msg = f"[PCA_QC_FAILURE] {tag} PCA explained variance: {var_sum:.4f} < 0.8. ABORTING."
                 logger.error(err_msg)
-                # Log per-component variance as requested
-                logger.info(f"[{name}] Component variance: {pca.explained_variance_ratio_}")
+                logger.info(f"[{tag}] Component variance ratios: {pca.explained_variance_ratio_}")
                 raise RuntimeError(err_msg)
+            logger.info(f"[PCA_QC_SUCCESS] {tag} PCA explained variance: {var_sum:.4f} >= 0.8")
 
         # [DIM_TRACE] STEP 3: EMBEDDING
         final_embed = self.get_embeddings(X_embed_base, already_scaled=True)
@@ -462,7 +462,22 @@ def add_time_series_features(df):
         new_features[f"{col}_expanding_std"] = series.expanding().std().values
 
     logger.info(f"[TS_FEATURES] Concat-ing {len(new_features)} new features")
-    return pd.concat([df, pd.DataFrame(new_features, index=df.index)], axis=1)
+    ts_df = pd.DataFrame(new_features, index=df.index)
+    
+    # [MISSION: PCA FEATURE SANITIZATION] Step 2: Noise Detection
+    # Identify features: rate_*, slope_*, diff_*, accel_*
+    # Keep ONLY if: variance sufficient (Step 1 rule: > 1e-6)
+    bad_derivatives = []
+    for col in ts_df.columns:
+        var = ts_df[col].var()
+        if var < 1e-6 or np.isnan(var):
+            bad_derivatives.append(col)
+    
+    if bad_derivatives:
+        logger.info(f"[TS_SANITIZATION] Removing {len(bad_derivatives)} noisy derivatives (low variance)")
+        ts_df = ts_df.drop(columns=bad_derivatives)
+        
+    return pd.concat([df, ts_df], axis=1)
 
 def add_extreme_detection_features(df):
     new_features = {}

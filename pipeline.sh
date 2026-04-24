@@ -29,6 +29,15 @@ run_pipeline() {
     LOG_DIR="logs/$RUN_ID"
     PIPELINE_LOG="$LOG_DIR/pipeline.log"
     mkdir -p "$LOG_DIR"
+    
+    # [DETERMINISM_FIX] Safe sync wrapper
+    safe_sync() {
+        if command -v sync >/dev/null 2>&1; then
+            sync && echo "[SYNC] Disk buffers flushed." || echo "[SYNC] Sync failed but continuing..."
+        else
+            echo "[SYNC] command not found, skipping."
+        fi
+    }
 
     echo "[PRE-CLEAN] Starting..." | tee -a "$PIPELINE_LOG"
     rm -rf logs/latest .done/latest 2>/dev/null || true
@@ -66,7 +75,7 @@ run_pipeline() {
         # [MEMORY_GUARD] Clear caches before major phases
         if [ "$phase" == "5_train_leakage_free" ]; then
             echo "[MEMORY_CLEAN] Aggressive sync for Phase 5..." | tee -a "$PIPELINE_LOG"
-            sync || true
+            safe_sync
         fi
 
         start_ts=$(date +%s)

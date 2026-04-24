@@ -32,6 +32,7 @@ run_pipeline() {
 
     echo "[PRE-CLEAN] Starting..." | tee -a "$PIPELINE_LOG"
     rm -rf logs/latest .done/latest 2>/dev/null || true
+    mkdir -p ".done/$RUN_ID"
     echo "[PRE-CLEAN] Complete." | tee -a "$PIPELINE_LOG"
 
     echo "============================================================" | tee -a "$PIPELINE_LOG"
@@ -40,11 +41,9 @@ run_pipeline() {
     echo "============================================================" | tee -a "$PIPELINE_LOG"
 
     # [PHASE 2: PIPELINE AUTO-SYNC]
-    # Fetch valid phases directly from main.py (Single Source of Truth)
     echo "[PIPELINE_SYNC] Fetching phase list from main.py..." | tee -a "$PIPELINE_LOG"
     
-    # We only execute phases that are part of the main sequential graph (start with a number)
-    PHASES_STR=$(python -c "from main import VALID_PHASES; print(' '.join([p for p in VALID_PHASES if p[0].isdigit()]))")
+    PHASES_STR=$(python -c "from main import VALID_PHASES; print(' '.join(VALID_PHASES))")
     read -a PHASES <<< "$PHASES_STR"
 
     if [ ${#PHASES[@]} -eq 0 ]; then
@@ -55,12 +54,21 @@ run_pipeline() {
     echo "[PIPELINE_PHASE_LIST] ${PHASES[*]}" | tee -a "$PIPELINE_LOG"
 
     for phase in "${PHASES[@]}"; do
-        # [PHASE 3: HARD VALIDATION LAYER]
-        # Although synced, we double-check against a validation script if necessary
-        # but here the sync itself provides the valid list.
+        DONE_MARKER=".done/$RUN_ID/$phase"
+        if [ -f "$DONE_MARKER" ]; then
+            echo "[SKIPPING] Phase $phase (Already Completed)" | tee -a "$PIPELINE_LOG"
+            continue
+        fi
 
         echo "------------------------------------------------------------" | tee -a "$PIPELINE_LOG"
         echo "[PHASE_EXECUTION_START] $phase" | tee -a "$PIPELINE_LOG"
+        
+        # [MEMORY_GUARD] Clear caches before major phases
+        if [ "$phase" == "5_train_leakage_free" ]; then
+            echo "[MEMORY_CLEAN] Aggressive sync for Phase 5..." | tee -a "$PIPELINE_LOG"
+            sync || true
+        fi
+
         start_ts=$(date +%s)
         phase_log="$LOG_DIR/$phase.log"
 
@@ -68,6 +76,7 @@ run_pipeline() {
             end_ts=$(date +%s)
             duration=$((end_ts - start_ts))
             echo "[PHASE_EXECUTION_SUCCESS] $phase (${duration}s)" | tee -a "$PIPELINE_LOG"
+            touch "$DONE_MARKER"
         else
             echo "[PHASE_EXECUTION_FAILED] $phase" | tee -a "$PIPELINE_LOG"
             echo "------------------------------------------------------------" | tee -a "$PIPELINE_LOG"
@@ -78,12 +87,18 @@ run_pipeline() {
         fi
     done
 
+    # [PHASE 4: LATEST SYMLINK]
+    rm -rf logs/latest 2>/dev/null || true
+    ln -s "$RUN_ID" logs/latest 2>/dev/null || true
+    echo "[PIPELINE] Symlink logs/latest -> $RUN_ID" | tee -a "$PIPELINE_LOG"
+
     SUBMISSION_PATH="./outputs/$RUN_ID/submission.csv"
-    INTELLIGENCE_PATH="./outputs/$RUN_ID/processed/retrain_diagnostics.json"
+    INTELLIGENCE_PATH="logs/$RUN_ID/validation_report.json"
 
     BEST_SCORE="N/A"
     if [ -f "$INTELLIGENCE_PATH" ]; then
-        BEST_SCORE=$(grep -oP '"overall_mae": \K[0-9.]+' "$INTELLIGENCE_PATH" | head -1 || echo "N/A")
+        # Use Python for portable and robust JSON parsing
+        BEST_SCORE=$(python -c "import json; print(json.load(open('$INTELLIGENCE_PATH'))['metrics']['mae'])" 2>/dev/null || echo "N/A")
     fi
 
     echo "============================================================" | tee -a "$PIPELINE_LOG"

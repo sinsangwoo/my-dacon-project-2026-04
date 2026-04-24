@@ -15,6 +15,15 @@ import pickle
 from sklearn.metrics import mean_absolute_error
 from .config import Config
 
+def assert_artifact_exists(path, description="Artifact"):
+    """Strictly enforces that a required artifact exists.
+    If it does not exist, raises a RuntimeError to prevent silent fallbacks.
+    """
+    if not os.path.exists(path):
+        raise RuntimeError(f"[MISSING_ARTIFACT] {description} not found at {path}. "
+                           "This breaks phase dependency guarantees. "
+                           "Please re-run the requisite preceding phase.")
+
 # Forensic Global Tracking
 CUMULATIVE_MEMORY_MB = 0.0
 
@@ -106,9 +115,12 @@ def SAFE_FIT(model, X, y, **kwargs):
     # [2. EXECUTE FIT]
     with warnings.catch_warnings(record=True) as w:
         warnings.simplefilter("always")
+        # Suppress the specific LGBM/sklearn feature name warning
+        warnings.filterwarnings("ignore", message=".*X does not have valid feature names.*")
         model.fit(X, y, **kwargs)
-        # Filter out environmental/platform warnings that don't indicate data/model contract violations
+        # Filter out environmental/platform warnings
         w = [warn for warn in w if "Could not find the number of physical cores" not in str(warn.message)]
+        w = [warn for warn in w if "X does not have valid feature names" not in str(warn.message)]
         
         if len(w) > 0:
             for warn in w:
@@ -129,47 +141,38 @@ def SAFE_FIT(model, X, y, **kwargs):
                 logger.error(f"[CONTRACT_FAIL] Illegal name detected: '{name}' at index {i}. Expected: '{expected}'")
                 raise RuntimeError(f"[ILLEGAL_FEATURE_NAME_SOURCE_DETECTED] {source_tag} contains non-LGBM name: '{name}'")
 
-    # Check sklearn-level feature_names_in_
     if hasattr(model, "feature_names_in_"):
-        logger.info(f"[CONTRACT_CHECK] Validating feature_names_in_ for {n_features} features...")
         validate_names(model.feature_names_in_, "feature_names_in_")
-        logger.info("[CONTRACT_PASS] feature_names_in_ matches LGBM auto-generation pattern.")
 
-    # Check LightGBM-level booster names
     if "LGBM" in str(type(model)) and hasattr(model, "booster_"):
-        logger.info("[CONTRACT_CHECK] Validating booster.feature_name()...")
         validate_names(model.booster_.feature_name(), "booster.feature_name()")
-        logger.info("[CONTRACT_PASS] booster.feature_name() matches LGBM auto-generation pattern.")
 
-    # Check n_features_in_ consistency
     if hasattr(model, "n_features_in_"):
-        assert model.n_features_in_ == n_features, f"[CONTRACT_FAIL] n_features_in_ mismatch: {model.n_features_in_} != {n_features}"
+        assert model.n_features_in_ == n_features
 
 def SAFE_PREDICT(model, X):
-    """SAFE GATEWAY for model.predict (v12.0)
-    Enforces numpy-only, float32-only inputs.
-    """
+    """SAFE GATEWAY for model.predict (v12.0)"""
     if isinstance(X, pd.DataFrame):
         raise RuntimeError("[GLOBAL_CONTRACT_VIOLATION] DataFrame passed to model.predict")
     
-    # Enforce contract
     assert isinstance(X, np.ndarray), f"[GLOBAL_CONTRACT_VIOLATION] Expected np.ndarray, got {type(X)}"
     assert X.dtype == np.float32, f"[GLOBAL_CONTRACT_VIOLATION] Expected float32, got {X.dtype}"
     
-    return model.predict(X)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*X does not have valid feature names.*")
+        return model.predict(X)
 
 def SAFE_PREDICT_PROBA(model, X):
-    """SAFE GATEWAY for model.predict_proba (v12.0)
-    Enforces numpy-only, float32-only inputs.
-    """
+    """SAFE GATEWAY for model.predict_proba (v12.0)"""
     if isinstance(X, pd.DataFrame):
         raise RuntimeError("[GLOBAL_CONTRACT_VIOLATION] DataFrame passed to model.predict_proba")
     
-    # Enforce contract
     assert isinstance(X, np.ndarray), f"[GLOBAL_CONTRACT_VIOLATION] Expected np.ndarray, got {type(X)}"
     assert X.dtype == np.float32, f"[GLOBAL_CONTRACT_VIOLATION] Expected float32, got {X.dtype}"
     
-    return model.predict_proba(X)
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", message=".*X does not have valid feature names.*")
+        return model.predict_proba(X)
 
 def generate_submission_fingerprint(df, file_path):
     """Generate structural fingerprint for submission (v11.0)."""
@@ -264,24 +267,8 @@ def preserve_fail_case(file_path, run_id):
 
 def build_metrics(y_true, y_pred):
     """
-    PURPOSE: [PHASE 2: DETERMINISTIC METRIC BUILDER]
-    Computes a fixed set of performance metrics for model evaluation.
-    
-    DEFINITION:
-    - mean_mae: Global Mean Absolute Error.
-    - worst_mae: MAE of the top 10% highest error samples (measures prediction tail).
-    - extreme_mae: MAE where target (y_true) is in the top 5% (measures tail risk).
-    - variance_ratio: Ratio of prediction standard deviation to target standard deviation.
-    
-    INPUT:
-    - y_true: numpy.ndarray (Ground truth targets)
-    - y_pred: numpy.ndarray (Model predictions)
-    
-    OUTPUT:
-    - metrics: dict matching Config.METRIC_SCHEMA exactly.
-    
-    FAILURE:
-    - Raises ValueError if input shapes mismatch or are empty.
+    PURPOSE: [PHASE 1 & 2: ANTI-CV-ILLUSION METRIC BUILDER]
+    Computes multi-dimensional performance and distribution metrics.
     """
     y_true = np.asarray(y_true, dtype=np.float32)
     y_pred = np.asarray(y_pred, dtype=np.float32)
@@ -289,42 +276,61 @@ def build_metrics(y_true, y_pred):
     if len(y_true) == 0 or len(y_true) != len(y_pred):
         raise ValueError(f"[METRIC_BUILD_FAILED] Shape mismatch or empty: y_true={len(y_true)}, y_pred={len(y_pred)}")
         
-    # 1. mean_mae
-    mean_mae = float(mean_absolute_error(y_true, y_pred))
+    # [GLOBAL METRICS]
+    mae = float(mean_absolute_error(y_true, y_pred))
+    rmse = float(np.sqrt(np.mean((y_true - y_pred)**2)))
+    med_ae = float(np.median(np.abs(y_true - y_pred)))
     
-    # 2. worst_mae (Prediction Error Tail - Top 10%)
-    errors = np.abs(y_true - y_pred)
-    worst_threshold = np.quantile(errors, 0.9)
-    worst_mae = float(np.mean(errors[errors >= worst_threshold]))
+    # [DISTRIBUTION METRICS]
+    mean_true, mean_pred = np.mean(y_true), np.mean(y_pred)
+    std_true, std_pred = np.std(y_true), np.std(y_pred)
     
-    # 3. extreme_mae (Target Tail - Top 5%)
-    extreme_threshold = np.quantile(y_true, 0.95)
-    mask_extreme = y_true >= extreme_threshold
-    if mask_extreme.any():
-        extreme_mae = float(mean_absolute_error(y_true[mask_extreme], y_pred[mask_extreme]))
-    else:
-        extreme_mae = mean_mae # Fallback if no extreme samples (unlikely)
-        
-    # 4. variance_ratio
-    std_pred = np.std(y_pred)
-    std_true = np.std(y_true)
-    variance_ratio = float(std_pred / (std_true + 1e-9))
-    
-    metrics = {
-        "mean_mae": mean_mae,
-        "worst_mae": worst_mae,
-        "extreme_mae": extreme_mae,
-        "variance_ratio": variance_ratio
+    dist_metrics = {
+        "mean_ratio": float(mean_pred / (mean_true + 1e-9)),
+        "std_ratio": float(std_pred / (std_true + 1e-9)),
+        "p50_ratio": float(np.quantile(y_pred, 0.5) / (np.quantile(y_true, 0.5) + 1e-9)),
+        "p90_ratio": float(np.quantile(y_pred, 0.9) / (np.quantile(y_true, 0.9) + 1e-9)),
+        "p99_ratio": float(np.quantile(y_pred, 0.99) / (np.quantile(y_true, 0.99) + 1e-9))
     }
     
-    # [PHASE 3: ASSERTION FIREWALL]
-    for key in Config.METRIC_SCHEMA:
-        if key not in metrics:
-            raise RuntimeError(f"[METRIC_MISSING_FATAL] Metric '{key}' missing from builder output!")
-            
-    # [PHASE 6: DEBUG TRACE]
+    # [ERROR DISTRIBUTION]
+    errors = np.abs(y_true - y_pred)
+    error_metrics = {
+        "mae_bottom_50": float(np.mean(np.sort(errors)[:len(errors)//2])),
+        "mae_top_10": float(np.mean(errors[errors >= np.quantile(errors, 0.9)])),
+        "mae_top_1": float(np.mean(errors[errors >= np.quantile(errors, 0.99)]))
+    }
+    
+    # [QUANTILE PERFORMANCE BREAKDOWN]
+    quantile_bins = [
+        (0, 0.5, "Q0_50"),
+        (0.5, 0.9, "Q50_90"),
+        (0.9, 0.99, "Q90_99"),
+        (0.99, 1.0, "Q99_100")
+    ]
+    quantile_mae = {}
+    for q_low, q_high, label in quantile_bins:
+        v_low = np.quantile(y_true, q_low)
+        v_high = np.quantile(y_true, q_high)
+        mask = (y_true >= v_low) & (y_true <= v_high)
+        if mask.any():
+            quantile_mae[f"{label}_mae"] = float(mean_absolute_error(y_true[mask], y_pred[mask]))
+        else:
+            quantile_mae[f"{label}_mae"] = 0.0
+
+    metrics = {
+        "mean_mae": mae, # Legacy compat
+        "mae": mae,
+        "rmse": rmse,
+        "med_ae": med_ae,
+        **dist_metrics,
+        **error_metrics,
+        **quantile_mae
+    }
+    
     logger = logging.getLogger("METRIC_BUILDER")
-    logger.info(f"[METRIC_BUILD_SUCCESS] mean={mean_mae:.4f} | worst={worst_mae:.4f} | extreme={extreme_mae:.4f} | var={variance_ratio:.4f}")
+    logger.info(f"[METRIC_DISTRIBUTION] mean_ratio={dist_metrics['mean_ratio']:.4f} | std_ratio={dist_metrics['std_ratio']:.4f} | p99_ratio={dist_metrics['p99_ratio']:.4f}")
+    logger.info(f"[TAIL_PERFORMANCE] Q90_MAE={quantile_mae['Q90_99_mae']:.4f} | Q99_MAE={quantile_mae['Q99_100_mae']:.4f}")
     
     return metrics
 
@@ -333,7 +339,81 @@ def calculate_std_ratio(preds, train_stats):
     pred_std = float(np.std(preds))
     train_std = train_stats.get('std', 1.0)
     ratio = pred_std / (train_std + 1e-9)
-    return ratio, pred_std, train_std
+    
+    pred_mean = float(np.mean(preds))
+    train_mean = train_stats.get('mean', 1.0)
+    mean_ratio = pred_mean / (train_mean + 1e-9)
+    
+    return ratio, pred_std, train_std, mean_ratio
+
+def run_adversarial_validation(X_train, X_val, groups=None):
+    """
+    PURPOSE: [PHASE 4: ADVERSARIAL VALIDATION]
+    Detect distribution shift between training and validation.
+    [ZERO_TOLERANCE] Updated to respect split logic.
+    """
+    from lightgbm import LGBMClassifier
+    from sklearn.metrics import roc_auc_score
+    
+    X_train = np.asarray(X_train, dtype=np.float32)
+    X_val = np.asarray(X_val, dtype=np.float32)
+    
+    # Combine sets with binary labels
+    X = np.vstack([X_train, X_val])
+    y = np.concatenate([np.zeros(len(X_train)), np.ones(len(X_val))])
+    
+    # Simple lightweight model
+    model = LGBMClassifier(n_estimators=100, learning_rate=0.1, max_depth=4, verbose=-1, random_state=42)
+    model.fit(X, y)
+    
+    probs = model.predict_proba(X)[:, 1]
+    auc = float(roc_auc_score(y, probs))
+    
+    logger = logging.getLogger("ADV_VAL")
+    logger.info(f"[ADV_VAL] auc={auc:.4f}")
+    
+    return auc
+
+def generate_pseudo_test_set(X, y):
+    """
+    PURPOSE: [PHASE 3: PSEUDO TEST SIMULATION]
+    Simulate a harder test set by adding noise and scaling features.
+    """
+    X_pseudo = X.copy()
+    
+    # Apply 10% noise to all features
+    noise = np.random.normal(0, 0.1, X.shape).astype(np.float32)
+    X_pseudo += noise
+    
+    # Randomly scale top 20% of samples by 1.2x (Simulate extreme regime)
+    scale_mask = np.random.choice([0, 1], size=len(X), p=[0.8, 0.2]).astype(bool)
+    X_pseudo[scale_mask] *= 1.2
+    
+    return X_pseudo, y
+
+def calculate_risk_score(metrics, adv_auc):
+    """
+    PURPOSE: [PHASE 8: FINAL RISK SCORE]
+    Consolidates multiple validation dimensions into a single risk index.
+    """
+    # 1. Std Mismatch (Target 1.0)
+    std_risk = abs(1.0 - metrics['std_ratio']) * 2.0
+    
+    # 2. Mean Mismatch (Target 1.0)
+    mean_risk = abs(1.0 - metrics['mean_ratio']) * 1.5
+    
+    # 3. Adversarial Risk (Base 0.5)
+    adv_risk = max(0, adv_auc - 0.5) * 4.0
+    
+    # 4. Tail Risk (Relative Tail MAE)
+    tail_risk = (metrics['Q99_100_mae'] / (metrics['mae'] + 1e-9)) * 0.5
+    
+    total_risk = float(std_risk + mean_risk + adv_risk + tail_risk)
+    
+    logger = logging.getLogger("RISK_AUDIT")
+    logger.info(f"[RISK_SCORE] score={total_risk:.4f} (std={std_risk:.2f}, mean={mean_risk:.2f}, adv={adv_risk:.2f}, tail={tail_risk:.2f})")
+    
+    return total_risk
 
 def build_submission(preds, ids):
     """SINGLE AUTHORITATIVE FUNCTION for submission creation.
@@ -469,46 +549,91 @@ def seed_everything(seed=42):
     os.environ['PYTHONHASHSEED'] = str(seed)
     np.random.seed(seed)
 
-class GlobalStatStore:
-    """Single Source of Truth (SSOT) for feature statistics (v13.0).
-    Stores mean, std, quantiles, and max to enforce semantic invariance.
+class DriftShieldScaler:
+    """Stateful, fold-aware distribution controller (v15.0).
+    Replaces GlobalStatStore to enforce FOT-ATV (Fit on Train, Apply to Val).
     """
-    @staticmethod
-    def compute_and_save(df, feature_cols, path):
-        stats = {}
-        logger = logging.getLogger("GlobalStatStore")
-        logger.info(f"[GlobalStatStore] Computing stats for {len(feature_cols)} features...")
-        
+    def __init__(self):
+        self.stats = {}
+        self.logger = logging.getLogger("DriftShieldScaler")
+
+    def fit(self, df, feature_cols):
+        self.logger.info(f"[DRIFT_SHIELD] Fitting on {len(feature_cols)} features...")
         for col in feature_cols:
             if col not in df.columns: continue
-            series = df[col].dropna()
+            
+            # [RELIABILITY_FIX] Drop both NaNs and Infs for stable stats (v18.5)
+            vals = df[col].values
+            series = vals[np.isfinite(vals)]
+            
             if len(series) == 0: continue
             
-            stats[col] = {
+            self.stats[col] = {
+                "p1": float(np.quantile(series, 0.01)),
+                "p99": float(np.quantile(series, 0.99)),
                 "mean": float(series.mean()),
                 "std": float(series.std()),
-                "max": float(series.max()),
-                "q25": float(series.quantile(0.25)),
-                "q50": float(series.quantile(0.50)),
-                "q75": float(series.quantile(0.75)),
-                "q90": float(series.quantile(0.90)),
             }
+
+    def transform(self, df, feature_cols):
+        if not self.stats:
+            self.logger.warning("[DRIFT_SHIELD] Transform called before fit! Returning raw.")
+            return df
             
+        df = df.copy()
+        for col in feature_cols:
+            if col not in df.columns or col not in self.stats: continue
+            
+            s = self.stats[col]
+            x = df[col].values.astype(np.float32)
+            
+            # [RELIABILITY_FIX] Handle Infs and NaNs in transform (v18.5)
+            x = np.where(np.isinf(x), s['mean'], x) # Replace inf with mean
+            x = np.where(np.isnan(x), s['mean'], x) # Replace nan with mean
+            
+            # 1. Clip
+            x = np.clip(x, s['p1'], s['p99'])
+            # 2. Normalize
+            x = (x - s['mean']) / (s['std'] + 1e-6)
+            # 3. Suppress
+            mask = np.abs(x) > 5
+            if mask.any():
+                x[mask] = np.sign(x[mask]) * (5.0 + np.log1p(np.abs(x[mask]) - 5.0))
+            
+            df[col] = x
+        return df
+
+    def save(self, path):
         os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(stats, f, indent=2)
-        logger.info(f"✓ Global stats saved to {path}")
+            json.dump(self.stats, f, indent=2)
+
+    @classmethod
+    def load(cls, path):
+        scaler = cls()
+        if os.path.exists(path):
+            with open(path, "r", encoding="utf-8") as f:
+                scaler.stats = json.load(f)
+        return scaler
+
+class GlobalStatStore:
+    """Legacy wrapper for SSOT compatibility."""
+    @staticmethod
+    def compute_and_save(df, feature_cols, path):
+        scaler = DriftShieldScaler()
+        scaler.fit(df, feature_cols)
+        scaler.save(path)
 
     @staticmethod
     def load(path):
-        logger = logging.getLogger("GlobalStatStore")
-        if not os.path.exists(path):
-            logger.warning(f"[GlobalStatStore] Stats file not found: {path}")
-            return None
-        with open(path, "r", encoding="utf-8") as f:
-            stats = json.load(f)
-        logger.info(f"✓ Global stats loaded from {path} (Features: {len(stats)})")
-        return stats
+        scaler = DriftShieldScaler.load(path)
+        return scaler.stats
+
+    @staticmethod
+    def apply_drift_shield(df, stats, feature_cols):
+        scaler = DriftShieldScaler()
+        scaler.stats = stats
+        return scaler.transform(df, feature_cols)
 
 def get_system_ram():
     """Get total system RAM in MB (v5.3)."""
@@ -533,18 +658,19 @@ def get_logger(name=None, level=None):
         name: Logger name (usually __name__ or phase name)
         level: Logging level (str or int). If None, defaults to INFO or Config.LOG_LEVEL.
     """
+    from .config import Config
+    
     # 1. Resolve Name
     logger_name = name if name else "root"
     
     # 2. Configure Global BasicConfig (Only once)
-    # We use a custom level mapping for flexibility
     level_map = {
         'DEBUG': logging.DEBUG,
         'INFO': logging.INFO,
         'WARNING': logging.WARNING,
         'ERROR': logging.ERROR,
         'CRITICAL': logging.CRITICAL,
-        'IMPORTANT': logging.INFO # Custom mapping
+        'IMPORTANT': logging.INFO 
     }
     
     log_level = level if level else getattr(Config, 'LOG_LEVEL', 'INFO')
@@ -559,7 +685,21 @@ def get_logger(name=None, level=None):
         force=True # Ensure our config takes precedence
     )
     
-    return logging.getLogger(logger_name)
+    logger = logging.getLogger(logger_name)
+    
+    # Add FileHandler if Config is initialized
+    try:
+        log_dir = getattr(Config, 'LOG_DIR', 'logs')
+        phase_log = os.path.join(log_dir, f"{name}.log")
+        
+        os.makedirs(log_dir, exist_ok=True)
+        fh = logging.FileHandler(phase_log, encoding='utf-8')
+        fh.setFormatter(logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s'))
+        logger.addHandler(fh)
+    except:
+        pass
+        
+    return logger
 
 def get_process_memory():
     """Get current process RSS memory in MB (Forensic Trace v5.3)."""

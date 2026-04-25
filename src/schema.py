@@ -51,21 +51,26 @@ BASE_COLS = [
 
 # 2. Sequential/Extreme Suffixes
 TS_SUFFIXES = [
-    '_rolling_mean_3', '_rolling_mean_5', '_rolling_std_3', '_rolling_std_5',
-    '_diff_1', '_diff_3', '_rate_1', '_slope_5', '_recent_max_5', '_recent_min_5',
-    '_range_5', '_expanding_mean', '_expanding_sum', '_expanding_std'
+    # [WHY_THIS_DESIGN] Canonical Trend & Stability Signals
+    # Problem: 300+ features were redundant and over-engineered.
+    # Why these 3: Captures State (rolling_mean), Stability (rolling_std), and Trend (diff).
+    # Why others removed: expanding_mean/std and slope were >90% redundant with these.
+    '_rolling_mean_5', '_rolling_std_5', '_diff_1',
+    '_is_boundary'
 ]
 
 EXTREME_SUFFIXES = [
-    '_rel_to_mean_5', '_rel_to_max_5', '_rel_rank_5', '_accel',
-    '_volatility_expansion_std', '_volatility_expansion_range', '_regime_id',
-    '_consecutive_above_q75'
+    # [WHY_THIS_DESIGN] Canonical Context Signal
+    # Problem: rel_rank, accel, and regime_id were redundant or noisy.
+    # Why this 1: rel_to_mean_5 provides necessary situational context (is this value high for this scenario?).
+    '_rel_to_mean_5'
 ]
 
 # 3. Latent / Embedding Features (Supercharged PCA)
 EMBED_DIM = 32
 MULTI_K = [10, 20, 40]
-LATENT_PATTERNS = ['embed_mean', 'embed_std', 'weighted_mean', 'trend_proxy', 'volatility_proxy']
+# [WHY_THIS_DESIGN] volatility_proxy removed as it was identical to embed_std.
+LATENT_PATTERNS = ['embed_mean', 'embed_std', 'weighted_mean', 'trend_proxy']
 
 def get_feature_schema():
     """Generates the deterministic feature manifest."""

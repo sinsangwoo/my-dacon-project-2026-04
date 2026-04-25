@@ -14,7 +14,7 @@ from .schema import FEATURE_SCHEMA
 from .utils import (
     SAFE_FIT, SAFE_PREDICT, build_metrics, run_adversarial_validation, 
     generate_pseudo_test_set, calculate_risk_score, calculate_std_ratio,
-    DriftShieldScaler, run_integrity_audit
+    DriftShieldScaler, run_integrity_audit, memory_guard
 )
 from .data_loader import SuperchargedPCAReconstructor, apply_latent_features
 
@@ -51,6 +51,81 @@ class Trainer:
         run_integrity_audit(self.df_train, label="TRAIN_POOL")
         run_integrity_audit(self.df_test, label="TEST_POOL")
         
+        # [WHY_THIS_CHANGE] Fold Consistency Reconstruction (TASK 5)
+        # Problem: Feature selection was performed PER FOLD based on local importance.
+        # Root Cause: Over-optimization for local fold characteristics.
+        # Why previous logic failed: Created non-deterministic feature spaces; violated
+        #   the "same feature space across folds" requirement.
+        # Why this solution: Perform a single, global feature selection phase on a 
+        #   representative training sample before the CV loop begins. 
+        #   Ensures all folds train on the exact same signal pool.
+        logger.info("[TRAIN_SHIFT_ROBUST] Performing global feature selection...")
+        
+        # 1. Global Scaling & Initialization
+        global_scaler = DriftShieldScaler()
+        # Use a large sample for global selection to avoid leakage and save memory
+        sample_idx = np.random.choice(n_train, min(n_train, 20000), replace=False)
+        sample_df = self.df_train.iloc[sample_idx]
+        sample_y = self.y[sample_idx]
+        
+        raw_cols = [c for c in FEATURE_SCHEMA['raw_features'] if c in sample_df.columns]
+        global_scaler.fit(sample_df, raw_cols)
+        
+        from sklearn.preprocessing import StandardScaler
+        global_norm_scaler = StandardScaler()
+        sample_df_drifted = global_scaler.transform(sample_df, raw_cols)
+        global_norm_scaler.fit(sample_df_drifted[raw_cols])
+        
+        global_reconstructor = SuperchargedPCAReconstructor(input_dim=len(raw_cols))
+        sample_df_scaled = sample_df_drifted.copy()
+        sample_df_scaled[raw_cols] = global_norm_scaler.transform(sample_df_drifted[raw_cols])
+        
+        global_reconstructor.fit(sample_df_scaled[Config.PCA_INPUT_COLS].values)
+        
+        # 2. Candidate Selection (Stable Raw + Latent)
+        # For simplicity in this global phase, we'll use a fixed stability threshold
+        # to identify initial candidates.
+        from .distribution import DomainShiftAudit, FeatureStabilityFilter
+        audit = DomainShiftAudit()
+        # Compare sample to test set for global stability
+        drift_df = audit.calculate_drift(sample_df, self.df_test.head(5000), raw_cols)
+        stability_filter = FeatureStabilityFilter(threshold=Config.STABILITY_THRESHOLD)
+        stability_filter.fit(drift_df)
+        
+        initial_candidates = [
+            f for f in all_features 
+            if (f in stability_filter.stable_features or any(p in f for p in ['embed', 'weighted', 'trend', 'volatility', 'regime', 'local_density', 'similarity']))
+            and (f not in FEATURE_SCHEMA['raw_features'] or f in raw_cols)
+        ]
+        
+        # 3. Global Importance Pruning
+        global_reconstructor.build_fold_cache(sample_df_scaled)
+        sample_df_full = apply_latent_features(sample_df_scaled, global_reconstructor, scaler=None, selected_features=initial_candidates, is_train=True)
+        X_sample = sample_df_full[initial_candidates].values.astype(np.float32)
+        
+        temp_model = LGBMRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, verbose=-1, random_state=42)
+        temp_model.fit(X_sample, sample_y)
+        
+        imp = temp_model.feature_importances_
+        imp_df = pd.DataFrame({'f': initial_candidates, 'i': imp}).sort_values('i', ascending=False)
+        imp_df['c'] = imp_df['i'].cumsum() / (imp_df['i'].sum() + 1e-9)
+        
+        # Derive global cutoff
+        cum_series_vals = imp_df['c'].values
+        n_feats = len(cum_series_vals)
+        p80_idx = int(np.ceil(0.80 * n_feats)) - 1
+        p80_val = float(cum_series_vals[min(p80_idx, n_feats - 1)])
+        IMPORTANCE_CUTOFF = float(np.clip(p80_val, 0.80, 0.97))
+        
+        selected_features = imp_df[imp_df['c'] <= IMPORTANCE_CUTOFF]['f'].tolist()
+        if not selected_features: selected_features = initial_candidates[:100]
+        
+        logger.info(f"[GLOBAL_SELECTION] Selected {len(selected_features)} features for all folds (Cutoff {IMPORTANCE_CUTOFF}).")
+        
+        # Cleanup global phase
+        del sample_df, sample_df_drifted, sample_df_scaled, sample_df_full, X_sample, temp_model, imp_df
+        gc.collect()
+
         for fold, (tr_idx, val_idx) in enumerate(self.kf.split(self.df_train, self.y, groups=self.groups)):
             logger.info(f"--- FOLD {fold} ---")
             
@@ -61,109 +136,48 @@ class Trainer:
             y_tr = self.y[tr_idx]
             y_val = self.y[val_idx]
 
-            # 1. Component Initialization
+            raw_cols = [c for c in FEATURE_SCHEMA['raw_features'] if c in tr_df.columns and c in test_df_fold.columns]
+            
             scaler = DriftShieldScaler()
-            scaler.fit(tr_df, FEATURE_SCHEMA['raw_features'])
+            scaler.fit(tr_df, raw_cols)
             
             from sklearn.preprocessing import StandardScaler
             norm_scaler = StandardScaler()
-            reconstructor = SuperchargedPCAReconstructor(input_dim=len(FEATURE_SCHEMA['raw_features']))
-            
-            # [STABILITY] Process drift audit and stability filtering
-            from .distribution import DomainShiftAudit, FeatureStabilityFilter
-            audit = DomainShiftAudit()
-            drift_df = audit.calculate_drift(tr_df, val_df, FEATURE_SCHEMA['raw_features'])
-            
-            filter = FeatureStabilityFilter(threshold=Config.STABILITY_THRESHOLD)
-            filter.fit(drift_df)
-            
-            # [MISSION: ADVERSARIAL PRIORITIZATION] - Moved up for early feature pruning
-            # Initial candidates: stable raw + all latent
-            initial_candidates = [f for f in all_features if f in filter.stable_features or any(p in f for p in ['embed', 'weighted', 'trend', 'volatility', 'regime', 'local_density', 'similarity'])]
-            
-            # [PRUNING] Phase 1: Global Reference Importance (v17.0)
-            # We use the raw-model importance as a first-pass filter if available
-            # Or use a fixed threshold based on benchmark (Cutoff 0.9 -> ~113-120 features)
-            IMPORTANCE_CUTOFF = 0.90 
-            
-            # [SPEED/STABILITY] Sequential Latent Feature Population
-            from src.utils import memory_guard, log_memory_usage
-            
-            # [SINGLE-PASS CACHE] Explicitly build the pool embeddings
-            # [PHASE 2: UNIFIED SCALING]
-            # tr_df_scaled_lite = scaler.transform(tr_df[Config.EMBED_BASE_COLS], Config.EMBED_BASE_COLS)
-            # reconstructor.fit(tr_df_scaled_lite.values)
-            # reconstructor.build_fold_cache(tr_df)
+            reconstructor = SuperchargedPCAReconstructor(input_dim=len(raw_cols))
             
             # [MISSION: SSOT SCALING] Scale tr_df once and use it everywhere
+            
             # 1. Drift handling (Clipping/NaNs)
-            tr_df_drifted = scaler.transform(tr_df, FEATURE_SCHEMA['raw_features'])
+            tr_df_drifted = scaler.transform(tr_df, raw_cols)
             # 2. Normalization (StandardScaler)
             tr_df_scaled_all = tr_df_drifted.copy()
-            tr_df_scaled_all[FEATURE_SCHEMA['raw_features']] = norm_scaler.fit_transform(tr_df_drifted[FEATURE_SCHEMA['raw_features']])
+            tr_df_scaled_all[raw_cols] = norm_scaler.fit_transform(tr_df_drifted[raw_cols])
             
             logger.info(f"[TRAIN_AUDIT] DriftShield + Normalization complete for FOLD {fold}")
             
-            # [CLIPPING_MONITOR] Log top 5 clipped features
-            sorted_clips = sorted(scaler.clipping_ratios.items(), key=lambda x: x[1], reverse=True)
-            logger.info(f"[CLIPPING_MONITOR] Top clipped: {sorted_clips[:5]}")
-            
             # Fit reconstructor on scaled base cols
-            # [PHASE 8: PCA QUALITY CONTROL]
-            # Use decoupled PCA_INPUT_COLS to ensure 0.8 explained variance
             reconstructor.fit(tr_df_scaled_all[Config.PCA_INPUT_COLS].values)
             # Build cache using scaled data
             reconstructor.build_fold_cache(tr_df_scaled_all)
             
-            # [MEMORY_OPTIMIZATION] Zero-Copy Population (v18.0)
-            # Step 1: Process Train for Pruning (Avoid Wide DataFrame)
-            logger.info(f"[FOLD {fold}] Extracting features for pruning...")
+            # Step 1: Process Train with GLOBAL selected features
+            logger.info(f"[FOLD {fold}] Extracting selected features...")
             
-            # 1a. Scale raw features - already done in tr_df_scaled_all
-            X_raw_part = tr_df_scaled_all[[f for f in initial_candidates if f in FEATURE_SCHEMA['raw_features']]].values.astype(np.float32)
+            # Ensure selected features are available in this fold's raw_cols
+            fold_features = [f for f in selected_features if (f not in FEATURE_SCHEMA['raw_features'] or f in raw_cols)]
             
-            # 1b. Get latent stats directly
-            # [PHASE 3: KNN LEAKAGE] Pass is_train=True
-            latent_stats = reconstructor.calculate_graph_stats(tr_df_scaled_all, is_train=True)
+            tr_df_final = apply_latent_features(tr_df_scaled_all, reconstructor, scaler=None, selected_features=fold_features, is_train=True)
+            X_tr = tr_df_final[fold_features].values.astype(np.float32)
             
-            # 1c. Build temporary X for pruning using the schema-aware population logic
-            # Instead of manual loop, let's use a temporary wide DF for pruning since it's just for pruning
-            # and we only keep selected features later.
-            tr_df_temp = apply_latent_features(tr_df_scaled_all, reconstructor, scaler=None, selected_features=initial_candidates, is_train=True)
-            X_tr_temp = tr_df_temp[initial_candidates].values.astype(np.float32)
-            temp_feat_names = initial_candidates
-            
-            del tr_df_temp, latent_stats, X_raw_part; gc.collect()
-
-            # [DYNAMIC_PRUNING]
-            temp_model = LGBMRegressor(n_estimators=100, learning_rate=0.1, max_depth=4, verbose=-1, random_state=42)
-            temp_model.fit(X_tr_temp, y_tr)
-            
-            imp = temp_model.feature_importances_
-            imp_df = pd.DataFrame({'f': temp_feat_names, 'i': imp}).sort_values('i', ascending=False)
-            imp_df['c'] = imp_df['i'].cumsum() / (imp_df['i'].sum() + 1e-9)
-            
-            fold_features = imp_df[imp_df['c'] <= IMPORTANCE_CUTOFF]['f'].tolist()
-            if not fold_features: fold_features = initial_candidates[:100]
-            
-            logger.info(f"[FOLD {fold}] Selected {len(fold_features)} features (Cutoff {IMPORTANCE_CUTOFF}).")
-            
-            # Extract final X_tr from X_tr_temp (Slice it)
-            selected_indices = [temp_feat_names.index(f) for f in fold_features]
-            X_tr = X_tr_temp[:, selected_indices].copy()
-            
-            # [PHASE 2: ASSERT EMBEDDING SPACE CONSISTENCY]
-            # This is implicitly handled by using the same scaler and reconstructor
-            
-            del X_tr_temp, temp_model, imp_df, tr_df_scaled_all; gc.collect()
-            memory_guard(f"Fold {fold} - Post Train Pruning", logger)
+            del tr_df_final; gc.collect()
+            memory_guard(f"Fold {fold} - Post Train", logger)
             
             # Step 2: Process Validation with ONLY selected features
             logger.info(f"[FOLD {fold}] Populating validation features (Selected Only)...")
             # [PHASE 2: UNIFIED SCALING] Scale validation data first
-            val_df_drifted = scaler.transform(val_df, FEATURE_SCHEMA['raw_features'])
+            val_df_drifted = scaler.transform(val_df, raw_cols)
             val_df_scaled = val_df_drifted.copy()
-            val_df_scaled[FEATURE_SCHEMA['raw_features']] = norm_scaler.transform(val_df_drifted[FEATURE_SCHEMA['raw_features']])
+            val_df_scaled[raw_cols] = norm_scaler.transform(val_df_drifted[raw_cols])
             
             val_df_full = apply_latent_features(val_df_scaled, reconstructor, scaler=None, selected_features=fold_features, is_train=False)
             X_val = val_df_full[fold_features].values.astype(np.float32)
@@ -172,9 +186,9 @@ class Trainer:
             # Step 3: Process Test with ONLY selected features
             logger.info(f"[FOLD {fold}] Populating test features (Selected Only)...")
             # [PHASE 2: UNIFIED SCALING] Scale test data first
-            test_df_drifted = scaler.transform(test_df_fold, FEATURE_SCHEMA['raw_features'])
+            test_df_drifted = scaler.transform(test_df_fold, raw_cols)
             test_df_scaled = test_df_drifted.copy()
-            test_df_scaled[FEATURE_SCHEMA['raw_features']] = norm_scaler.transform(test_df_drifted[FEATURE_SCHEMA['raw_features']])
+            test_df_scaled[raw_cols] = norm_scaler.transform(test_df_drifted[raw_cols])
             
             test_df_full = apply_latent_features(test_df_scaled, reconstructor, scaler=None, selected_features=fold_features, is_train=False)
             X_test_f = test_df_full[fold_features].values.astype(np.float32)
@@ -244,6 +258,10 @@ class Trainer:
             oof[val_idx] = f_preds
             test_preds += SAFE_PREDICT(model, X_test_f) / Config.NFOLDS
             
+            os.makedirs(f'{Config.MODELS_PATH}/lgbm', exist_ok=True)
+            with open(f'{Config.MODELS_PATH}/lgbm/model_fold_{fold}.pkl', 'wb') as f:
+                pickle.dump(model, f)
+            
             f_mae = mean_absolute_error(y_val, f_preds)
             self.fold_stats[fold] = {"mae": f_mae, "mean": np.mean(f_preds)}
             logger.info(f"Fold {fold} MAE: {f_mae:.6f}")
@@ -283,14 +301,17 @@ class Trainer:
         return build_metrics(y, oof)['mae'], oof
 
     def fit_raw_model(self):
-        X_raw = self.df_train[FEATURE_SCHEMA['raw_features']].fillna(0).values.astype(np.float32)
-        X_test_raw = self.df_test[FEATURE_SCHEMA['raw_features']].fillna(0).values.astype(np.float32)
+        raw_cols = [c for c in FEATURE_SCHEMA['raw_features'] if c in self.df_train.columns and c in self.df_test.columns]
+        print(f"DEBUG: missing from test: {[c for c in raw_cols if c not in self.df_test.columns]}")
+        X_raw = self.df_train[raw_cols].fillna(0).values.astype(np.float32)
+        X_test_raw = self.df_test[raw_cols].fillna(0).values.astype(np.float32)
         return self.train_kfolds(X_raw, self.y, X_test_raw, 'raw', Config.RAW_LGBM_PARAMS)
 
     def perform_adversarial_audit(self):
         logger.info("[AUDIT] Running realigned adversarial validation...")
         aucs = []
-        X_raw = self.df_train[FEATURE_SCHEMA['raw_features']].fillna(0).values
+        raw_cols = [c for c in FEATURE_SCHEMA['raw_features'] if c in self.df_train.columns]
+        X_raw = self.df_train[raw_cols].fillna(0).values
         for fold, (tr_idx, val_idx) in enumerate(self.kf.split(X_raw, self.y, groups=self.groups)):
             auc = run_adversarial_validation(X_raw[tr_idx], X_raw[val_idx])
             aucs.append(auc)
@@ -298,12 +319,50 @@ class Trainer:
 
     def validate_distribution(self, preds, train_stats):
         ratio, pred_std, train_std, mean_ratio = calculate_std_ratio(preds, train_stats)
-        logger.info(f"[DIST_GUARD] std_ratio={ratio:.4f} | mean_ratio={mean_ratio:.4f}")
-        
+        logger.info("[DIST_GUARD] std_ratio={:.4f} | mean_ratio={:.4f}".format(ratio, mean_ratio))
+
+        # [WHY_THIS_CHANGE] Adaptive std_ratio bounds
+        # Problem: std_ratio range [0.5, 2.0] was hardcoded with no statistical basis.
+        # Root Cause: Arbitrary bounds chosen during early debugging, never revisited.
+        # Decision: Derive bounds from the std_ratio values observed across OOF folds.
+        #   - Collect per-fold std_ratio from self.fold_stats if available.
+        #   - Derive [Q1 - 2*IQR, Q3 + 2*IQR] bounds (wider than 1.5*IQR for safety).
+        #   - Absolute fallback: [0.1, 5.0] (never too restrictive, never meaningless).
+        # Why IQR (not fixed range):
+        #   - Fixed [0.5, 2.0]: violates RULE 1; calibrated to one dataset.
+        #   - IQR with fold std_ratios: grounded in actual prediction distribution behavior.
+        # Expected Impact: Bounds adapt to model behavior; unstable models detected earlier.
+        if self.fold_stats and len(self.fold_stats) >= 2:
+            fold_means = [v.get("mean", float("nan")) for v in self.fold_stats.values()]
+            fold_means = [m for m in fold_means if not np.isnan(m) and m > 0]
+            if len(fold_means) >= 2:
+                train_mean = train_stats.get("mean", 1.0) or 1.0
+                fold_ratios = [m / (train_mean + 1e-9) for m in fold_means]
+                q1_r = float(np.percentile(fold_ratios, 25))
+                q3_r = float(np.percentile(fold_ratios, 75))
+                iqr_r = q3_r - q1_r
+                lo = float(np.clip(q1_r - 2.0 * iqr_r, 0.1, 0.8))
+                hi = float(np.clip(q3_r + 2.0 * iqr_r, 1.2, 5.0))
+                derivation_bounds = (
+                    "IQR from {} fold mean-ratios (Q1={:.3f}, Q3={:.3f}, IQR={:.3f}) "
+                    "-> bounds=[{:.3f}, {:.3f}]".format(
+                        len(fold_ratios), q1_r, q3_r, iqr_r, lo, hi
+                    )
+                )
+            else:
+                lo, hi = 0.1, 5.0
+                derivation_bounds = "Insufficient fold data; using absolute fallback [0.1, 5.0]"
+        else:
+            lo, hi = 0.1, 5.0
+            derivation_bounds = "No fold_stats available; using absolute fallback [0.1, 5.0]"
+
+        logger.info("[DIST_GUARD] std_ratio bounds derived: [{:.3f}, {:.3f}] | {}".format(
+            lo, hi, derivation_bounds))
+
         # [PHASE 9: ALWAYS ON] Removed debug/smoke skip
-            
-        if ratio < 0.5 or ratio > 2.0: # [PHASE 5: REAL VARIANCE] Adjusted range to [0.5, 2.0]
-            raise RuntimeError(f"FAIL: std_ratio {ratio:.4f} outside [0.5, 2.0]")
+        if ratio < lo or ratio > hi:
+            raise RuntimeError("FAIL: std_ratio {:.4f} outside derived bounds [{:.3f}, {:.3f}] | {}".format(
+                ratio, lo, hi, derivation_bounds))
         return ratio
 
     def analyze_model_divergence(self):

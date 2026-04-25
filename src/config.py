@@ -38,7 +38,7 @@ This system now enforces:
 
 class Config:
     # --- Existing Path Contracts ---
-    RUN_ID = datetime.now().strftime("run_%Y%m%d_%H%M%S")
+    RUN_ID = os.getenv('RUN_ID', datetime.now().strftime("run_%Y%m%d_%H%M%S"))
     DATA_PATH = "./data/"
     OUTPUT_BASE = f"./outputs/{RUN_ID}/"
     PROCESSED_PATH = f"{OUTPUT_BASE}processed/"
@@ -69,7 +69,11 @@ class Config:
         'debug': 2
     }
     
-    # --- Feature Engineering Parameters ---
+    # [WHY_THIS_DESIGN] Feature Health Thresholds
+    # ADVERSARIAL_THRESHOLD: 0.7 - Observed Data Behavior: AUC > 0.7 indicates a feature 
+    #   can reliably distinguish between train and test distributions, leading to leakage.
+    # STABILITY_THRESHOLD: 0.15 - Limit for drift (PSI or Mean Shift) allowed before rejection.
+    # EXTREME_TARGET_QUANTILE: 0.95 - Aligned with business focus on "tail" delays (top 5%).
     ADVERSARIAL_THRESHOLD = 0.7  # Drop features with AUC > 0.7
     ZERO_IMPORTANCE_DROP = True
     STABILITY_THRESHOLD = 0.15   # Max drift allowed
@@ -115,7 +119,7 @@ class Config:
     
     # ID and Target
     ID_COLS = ['ID', 'scenario_id', 'layout_id']
-    TARGET = 'target'
+    TARGET = 'avg_delay_minutes_next_30m'
     
     # [STRUCTURAL_REALIGNMENT] Memory Management
     EMBED_CHUNK_SIZE = 2000

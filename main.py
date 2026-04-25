@@ -116,9 +116,29 @@ def run_phase(phase, mode, smoke_test=False):
             elif Config.MODE in ['trace', 'debug']:
                 train = train.head(Config.TRACE_ROWS); test = test.head(Config.TRACE_ROWS)
             
-            # [ZERO_TOLERANCE] Build isolated base features ONLY
-            train_base = build_base_features(train)
-            test_base = build_base_features(test)
+            # [WHY_THIS_CHANGE] Zero-Hardcode Pipeline Reconstruction
+            # Problem: Phase 2 previously computed thresholds independently for train/test.
+            #   This introduced data leakage as test distribution influenced test pruning.
+            # Decision: Build manifest on train, apply to test. Record decisions in registry.
+            # Why this approach: Ensures deterministic pruning logic across datasets.
+            train_base, manifest, registry = build_base_features(train)
+            test_base = build_base_features(test, pruning_manifest=manifest)
+
+            # [WHY_THIS_CHANGE] Zero-Failure Contract
+            # Ensure train and test features are perfectly synchronized before proceeding.
+            # This is critical for downstream PCA and model inference consistency.
+            train_cols = [c for c in train_base.columns if c not in Config.ID_COLS and c != Config.TARGET]
+            test_cols = [c for c in test_base.columns if c not in Config.ID_COLS]
+            if train_cols != test_cols:
+                logger.error(f"[SCHEMA_MISMATCH] Train count: {len(train_cols)}, Test count: {len(test_cols)}")
+                diff = set(train_cols) ^ set(test_cols)
+                logger.error(f"[SCHEMA_MISMATCH] Symmetric difference: {list(diff)[:10]}")
+                raise RuntimeError(f"Strict Schema Synchronization failed between Train and Test.")
+            logger.info(f"[SCHEMA_SYNC] Perfect match: {len(train_cols)} features synchronized.")
+
+            # Save audit artifacts for forensics and cross-phase consistency
+            manifest.save(f'{Config.PROCESSED_PATH}/pruning_manifest.json')
+            registry.save(f'{Config.SUMMARY_DIR}/feature_drop_registry.json')
             
             # Save dataframes for the fold loop
             train_base.to_pickle(f'{Config.PROCESSED_PATH}/train_base.pkl')
@@ -225,20 +245,26 @@ def run_phase(phase, mode, smoke_test=False):
                     scaler = pickle.load(f)
                 with open(f'{Config.MODELS_PATH}/reconstructors/features_fold_{fold}.pkl', 'rb') as f:
                     fold_features = pickle.load(f)
+                with open(f'{Config.MODELS_PATH}/reconstructors/norm_scaler_fold_{fold}.pkl', 'rb') as f:
+                    norm_scaler = pickle.load(f)
                 with open(f'{Config.MODELS_PATH}/lgbm/model_fold_{fold}.pkl', 'rb') as f:
                     model = pickle.load(f)
                 
                 # Apply features strictly via pre-computed cache
                 from src.data_loader import apply_latent_features
-                # [PHASE 2: UNIFIED SCALING] Scale test data before latent population
-                test_base_scaled = scaler.transform(test_base, FEATURE_SCHEMA['raw_features'])
-                test_df_full = apply_latent_features(test_base_scaled, reconstructor, scaler=None)
+                # [PHASE 2: UNIFIED SCALING] Scale test data before latent population using fold-specific schema
+                raw_cols = list(norm_scaler.feature_names_in_)
+                test_base_drifted = scaler.transform(test_base, raw_cols)
+                test_base_scaled = test_base_drifted.copy()
+                test_base_scaled[raw_cols] = norm_scaler.transform(test_base_drifted[raw_cols])
+                
+                test_df_full = apply_latent_features(test_base_scaled, reconstructor, scaler=None, selected_features=fold_features, is_train=False)
                 X_test_f = test_df_full[fold_features].values.astype(np.float32)
                 
                 from src.utils import SAFE_PREDICT
                 test_preds += SAFE_PREDICT(model, X_test_f) / Config.NFOLDS
                 
-                del reconstructor, scaler, model, test_df_full
+                del reconstructor, scaler, norm_scaler, model, test_df_full
                 gc.collect()
             
             save_npy(test_preds, f'{Config.PREDICTIONS_PATH}/final_submission.npy')

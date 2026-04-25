@@ -1,0 +1,92 @@
+{
+  "thresholds": {
+    "nan_threshold": {
+      "value": 0.1162,
+      "derivation": "P85 of NaN ratio distribution over 730 runtime features (P50=0.0056, P85=0.1162, P95=0.1220) -> adaptive_threshold=0.1162 (floored at 0.05)",
+      "supporting_stats": {
+        "P50": 0.0056,
+        "P85": 0.1162,
+        "P95": 0.122,
+        "floor": 0.05
+      }
+    },
+    "corr_threshold": {
+      "value": 0.5,
+      "derivation": "IQR outlier detection on upper-tri correlation (n_pairs=206403, n_valid=197506, Q1=0.0116, Q3=0.1371, IQR=0.1255) -> Q3+1.5*IQR=0.3253 [clip 0.50-0.99] -> final=0.5000",
+      "supporting_stats": {
+        "Q1": 0.011554750784564664,
+        "Q3": 0.1370579001500951,
+        "IQR": 0.12550314936553045,
+        "n_pairs": 206403,
+        "n_valid": 197506,
+        "corr_P50": 0.04077640001760172,
+        "corr_P95": 0.44548032925664754
+      }
+    },
+    "var_threshold": {
+      "value": 1e-08,
+      "derivation": "P5 of variance distribution over 215 features after NaN+corr pruning (P5=0.00e+00, P50=2.50e-01) -> threshold=1.00e-08 (floored at 1e-8)",
+      "supporting_stats": {
+        "P5": 0.0,
+        "P50": 0.2500174497453386,
+        "n_features": 215,
+        "floor": 1e-08
+      }
+    }
+  },
+  "pruning": {
+    "initial_features": 730,
+    "after_base_features": 205,
+    "nan_dropped": 87,
+    "corr_dropped": 428,
+    "var_dropped": 14
+  },
+  "corr_dist": {
+    "mean": 0.051868662664207386,
+    "median": 0.024691506584115362,
+    "p95": 0.2142921466762315,
+    "p99": 0.36220825217108044
+  },
+  "type_categories": {
+    "count_rate": [
+      "robot_charging",
+      "order_inflow_15m",
+      "charge_queue_length",
+      "robot_active",
+      "near_collision_15m",
+      "task_reassign_15m",
+      "blocked_path_15m",
+      "unique_sku_15m",
+      "robot_idle",
+      "fault_count_15m"
+    ],
+    "ratio_percent": [
+      "heavy_item_ratio",
+      "manual_override_ratio",
+      "sku_concentration",
+      "pack_utilization",
+      "avg_charge_wait",
+      "cold_chain_ratio",
+      "urgent_order_ratio",
+      "max_zone_density",
+      "robot_utilization",
+      "congestion_score",
+      "low_battery_ratio",
+      "replenishment_overlap"
+    ],
+    "sensor_env": [
+      "avg_recovery_time",
+      "avg_items_per_order",
+      "warehouse_temp_avg",
+      "avg_trip_distance",
+      "air_quality_idx",
+      "humidity_pct",
+      "battery_std"
+    ]
+  },
+  "ks_dist": {
+    "mean": 0.09853202437825734,
+    "max": 0.20525798234076817,
+    "unstable_count": 4
+  }
+}

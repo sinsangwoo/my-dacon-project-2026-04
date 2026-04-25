@@ -618,6 +618,11 @@ class DriftShieldScaler:
             if clip_pct > 0.05:
                 self.logger.warning(f"[CLIPPING_MONITOR] High clipping: {col}={clip_pct:.2%}")
             
+            # [WHY_THIS_DESIGN] Outlier Clipping
+            # Observed Data Behavior: Heavy-tailed distribution in delay-related features.
+            # Why P1/P99: Captures 98% of variance while suppressing extreme sensor noise 
+            #   that can destabilize Gradient Boosting and PCA reconstruction.
+            # Sensitivity: P95 is too aggressive (loses real spikes); P99.9 preserves too much noise.
             x = np.clip(x, s['p1'], s['p99'])
             
             # [PHASE 5: VARIANCE RESTORATION]
@@ -633,7 +638,8 @@ class DriftShieldScaler:
                 self.logger.error(f"!!! [VARIANCE_COMPRESSION] {col} ratio={ratio:.4f} !!!")
             
             df[col] = x
-        return df
+        # [AXIS3_FIX] 이중 return 제거. 두 번째 return df는 데드 코드이며,
+        # 향후 두 return 사이에 로직 삽입 시 의도치 않은 흐름이 발생할 수 있다.
         return df
 
     def save(self, path):

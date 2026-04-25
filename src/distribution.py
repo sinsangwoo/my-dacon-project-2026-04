@@ -54,21 +54,91 @@ class DomainShiftAudit:
         logger.info(f"[DRIFT_AUDIT] Drift report saved to {path}")
 
 class FeatureStabilityFilter:
-    """Auto-isolation of unstable features based on drift audit results."""
-    
-    def __init__(self, threshold=0.25):
+    """Auto-isolation of unstable features based on drift audit results.
+
+    [WHY_THIS_CHANGE]
+    Problem:
+        __init__ had a hardcoded default threshold of 0.25 with no statistical basis.
+        The value was passed in from Config.STABILITY_THRESHOLD (also a fixed constant)
+        making both the default and the override arbitrary.
+    Root Cause:
+        Original design treated 0.25 as a universal KS-statistic cutoff, ignoring that
+        the actual KS distribution varies with dataset size and feature correlation.
+    Decision:
+        If threshold is None (default), derive it from the KS-statistic distribution
+        using IQR-based outlier detection: threshold = Q3 + 1.5 * IQR.
+        -> Treats high-drift features as "outliers" in the drift distribution.
+        -> Adapts to datasets where all features are slightly drifted (raises bar)
+           or where drift is severe (lowers bar).
+    Why IQR (not alternatives):
+        - Fixed 0.25: violates RULE 1.
+        - Simple percentile: another form of hardcoding.
+        - IQR: robust, interpretable, scale-invariant.
+    Expected Impact:
+        Stability threshold adapts to the actual drift severity in each fold.
+        Derivation is logged for full traceability.
+    """
+
+    def __init__(self, threshold=None):
+        # [WHY_THIS_CHANGE] threshold=None by default; if None, derived at fit() time.
+        # Previously: threshold=0.25 (hardcoded). Now: data-driven or caller-supplied.
         self.threshold = threshold
         self.unstable_features = []
         self.stable_features = []
+        self.derived_threshold = None
+        self.derivation_log = None
 
     def fit(self, drift_df):
-        """Identify features exceeding the drift threshold."""
-        self.unstable_features = drift_df[drift_df['ks_stat'] > self.threshold]['feature'].tolist()
-        self.stable_features = drift_df[drift_df['ks_stat'] <= self.threshold]['feature'].tolist()
-        
-        logger.info(f"[STABILITY_FILTER] Identified {len(self.unstable_features)} unstable features (KS > {self.threshold})")
-        logger.info(f"[STABILITY_FILTER] Top unstable: {self.unstable_features[:5]}")
-        
+        """Identify features exceeding the drift threshold.
+
+        If self.threshold is None, derives it from the KS-statistic distribution
+        using IQR-based outlier detection.
+        """
+        ks_vals = drift_df['ks_stat'].dropna().values
+
+        if self.threshold is None:
+            # [WHY_THIS_CHANGE] Adaptive KS threshold derivation
+            # Problem: No threshold provided → old code would crash or use 0.25 default.
+            # Root Cause: Hardcoded default.
+            # Decision: Derive from IQR of the KS distribution.
+            if len(ks_vals) >= 4:
+                q1 = float(np.percentile(ks_vals, 25))
+                q3 = float(np.percentile(ks_vals, 75))
+                iqr = q3 - q1
+                derived = float(np.clip(q3 + 1.5 * iqr, 0.05, 0.99))
+            else:
+                # Fallback: median of KS values when sample too small for IQR
+                derived = float(np.median(ks_vals)) if len(ks_vals) > 0 else 0.25
+                logger.warning(
+                    "[STABILITY_FILTER] Too few features for IQR derivation. "
+                    "Using median KS = {:.4f} as threshold.".format(derived)
+                )
+            self.derived_threshold = derived
+            self.derivation_log = (
+                "IQR outlier detection on KS distribution "
+                "(n={}, Q3={:.4f}, IQR={:.4f}) -> Q3+1.5*IQR = {:.4f} [clip 0.05-0.99]".format(
+                    len(ks_vals),
+                    np.percentile(ks_vals, 75) if len(ks_vals) >= 4 else float('nan'),
+                    (np.percentile(ks_vals, 75) - np.percentile(ks_vals, 25)) if len(ks_vals) >= 4 else float('nan'),
+                    derived
+                )
+            )
+            effective_threshold = derived
+            logger.info("[STABILITY_FILTER] Derived adaptive threshold={:.4f} | {}".format(
+                derived, self.derivation_log))
+        else:
+            effective_threshold = self.threshold
+            self.derived_threshold = self.threshold
+            self.derivation_log = "Caller-supplied threshold={:.4f}".format(self.threshold)
+            logger.info("[STABILITY_FILTER] Using caller-supplied threshold={:.4f}".format(self.threshold))
+
+        self.unstable_features = drift_df[drift_df['ks_stat'] > effective_threshold]['feature'].tolist()
+        self.stable_features = drift_df[drift_df['ks_stat'] <= effective_threshold]['feature'].tolist()
+
+        logger.info("[STABILITY_FILTER] Identified {} unstable features (KS > {:.4f})".format(
+            len(self.unstable_features), effective_threshold))
+        logger.info("[STABILITY_FILTER] Top unstable: {}".format(self.unstable_features[:5]))
+
     def transform(self, features):
         """Filter list of features to exclude unstable ones."""
         return [f for f in features if f not in self.unstable_features]

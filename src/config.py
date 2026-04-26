@@ -43,7 +43,7 @@ class Config:
     OUTPUT_BASE = f"./outputs/{RUN_ID}/"
     PROCESSED_PATH = f"{OUTPUT_BASE}processed/"
     MODELS_PATH = f"{OUTPUT_BASE}models/"
-    SUBMISSION_PATH = f"{OUTPUT_BASE}submission/submission.csv"
+    SUBMISSION_PATH = f"{OUTPUT_BASE}submission.csv"
     PREDICTIONS_PATH = f"{OUTPUT_BASE}predictions/"
     LOG_DIR = f"{OUTPUT_BASE}logs/"
     SUMMARY_DIR = f"{OUTPUT_BASE}summary/"
@@ -60,6 +60,7 @@ class Config:
     FORCE_OVERWRITE = False
     TRACE_LEVEL = "INFO"
     LOG_LEVEL = "INFO"
+    SMOKE_TEST = False
     
     ADAPTIVE_FOLDS = {
         'raw': 3,
@@ -132,7 +133,7 @@ class Config:
         cls.OUTPUT_BASE = f"./outputs/{cls.RUN_ID}/"
         cls.PROCESSED_PATH = f"{cls.OUTPUT_BASE}processed/"
         cls.MODELS_PATH = f"{cls.OUTPUT_BASE}models/"
-        cls.SUBMISSION_PATH = f"{cls.OUTPUT_BASE}submission/submission.csv"
+        cls.SUBMISSION_PATH = f"{cls.OUTPUT_BASE}submission.csv"
         cls.PREDICTIONS_PATH = f"{cls.OUTPUT_BASE}predictions/"
         cls.LOG_DIR = f"{cls.OUTPUT_BASE}logs/"
         cls.SUMMARY_DIR = f"{cls.OUTPUT_BASE}summary/"

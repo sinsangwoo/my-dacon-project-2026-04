@@ -30,11 +30,16 @@ class DomainShiftAudit:
             # 1. KS Test (D-statistic)
             ks_stat, p_val = ks_2samp(s_tr, s_te)
             
+            # [TASK 3] Wasserstein Distance for robust distribution shift
+            from scipy.stats import wasserstein_distance
+            wd = wasserstein_distance(s_tr, s_te)
+            
             # 2. Moments comparison
             drift_results.append({
                 "feature": col,
                 "ks_stat": float(ks_stat),
                 "p_value": float(p_val),
+                "wasserstein": float(wd),
                 "tr_mean": float(s_tr.mean()),
                 "te_mean": float(s_te.mean()),
                 "tr_std": float(s_tr.std()),
@@ -53,92 +58,134 @@ class DomainShiftAudit:
         drift_df.to_csv(path, index=False)
         logger.info(f"[DRIFT_AUDIT] Drift report saved to {path}")
 
+class VarianceMonitor:
+    """
+    [WHY_THIS_CHANGE] Decoupled variance diagnostics from DriftShieldScaler (Task 1).
+    [ROOT_CAUSE] Scaling logic was generating false-positive warnings by comparing clipped to unclipped std.
+    [EXPECTED_IMPACT] Scaling is purely functional. Diagnostics happen here and distinguish natural shift from collapse.
+    """
+    def __init__(self):
+        self.logger = logging.getLogger("VarianceMonitor")
+
+    def audit_variance(self, df, baseline_stats, feature_cols):
+        self.logger.info("[VARIANCE_MONITOR] Auditing variance shifts...")
+        
+        stats_summary = {'total': 0, 'natural_shift': 0, 'collapse': 0}
+        
+        for col in feature_cols:
+            if col not in df.columns or col not in baseline_stats: continue
+            
+            s = baseline_stats[col]
+            current_vals = df[col].dropna().values
+            if len(current_vals) < 10: continue
+            
+            stats_summary['total'] += 1
+            current_std = np.std(current_vals) + 1e-9
+            baseline_std = s.get('clipped_std', s['std']) + 1e-9
+            ratio = current_std / baseline_std
+            
+            # [TASK 5] Quantile Drift
+            curr_p1 = np.percentile(current_vals, 1)
+            curr_p99 = np.percentile(current_vals, 99)
+            base_p1 = s['p1']
+            base_p99 = s['p99']
+            
+            base_range = abs(base_p99 - base_p1) + 1e-9
+            drift_p1 = abs(curr_p1 - base_p1) / base_range
+            drift_p99 = abs(curr_p99 - base_p99) / base_range
+            max_q_drift = max(drift_p1, drift_p99)
+            
+            # [TASK 5] Differentiate collapse vs natural shift using combined metrics
+            is_variance_collapse = ratio < 0.2
+            is_shape_collapse = max_q_drift > 0.50
+            
+            if is_variance_collapse and is_shape_collapse:
+                self.logger.error(f"!!! [TRUE_DISTRIBUTION_COLLAPSE] {col} variance dropped to {ratio:.2%} AND shape collapsed (Q-Drift: {max_q_drift:.2%})")
+                stats_summary['collapse'] += 1
+            elif ratio < 0.6:
+                # Expected for rate/slope features after clipping or in new regimes
+                self.logger.info(f"[NATURAL_REGIME_SHIFT] {col} variance compressed to {ratio:.2%} but shape is stable (Q-Drift: {max_q_drift:.2%})")
+                stats_summary['natural_shift'] += 1
+                
+        return stats_summary
 class FeatureStabilityFilter:
     """Auto-isolation of unstable features based on drift audit results.
 
     [WHY_THIS_CHANGE]
-    Problem:
-        __init__ had a hardcoded default threshold of 0.25 with no statistical basis.
-        The value was passed in from Config.STABILITY_THRESHOLD (also a fixed constant)
-        making both the default and the override arbitrary.
-    Root Cause:
-        Original design treated 0.25 as a universal KS-statistic cutoff, ignoring that
-        the actual KS distribution varies with dataset size and feature correlation.
-    Decision:
-        If threshold is None (default), derive it from the KS-statistic distribution
-        using IQR-based outlier detection: threshold = Q3 + 1.5 * IQR.
-        -> Treats high-drift features as "outliers" in the drift distribution.
-        -> Adapts to datasets where all features are slightly drifted (raises bar)
-           or where drift is severe (lowers bar).
-    Why IQR (not alternatives):
-        - Fixed 0.25: violates RULE 1.
-        - Simple percentile: another form of hardcoding.
-        - IQR: robust, interpretable, scale-invariant.
-    Expected Impact:
-        Stability threshold adapts to the actual drift severity in each fold.
-        Derivation is logged for full traceability.
+    Redesigned to be a "Soft Gate" and signal-type aware (Task 2 & 3).
+    [ROOT_CAUSE]
+    High-sensitivity signals like rate_1 and slope_5 were hard-filtered due to natural distribution shifts, falsely flagged as instability.
+    [EXPECTED_IMPACT]
+    Valid signals are allowed to pass to the model evaluation phase. Trend/Volatility features are evaluated with relaxed rules.
     """
-
     def __init__(self, threshold=None):
-        # [WHY_THIS_CHANGE] threshold=None by default; if None, derived at fit() time.
-        # Previously: threshold=0.25 (hardcoded). Now: data-driven or caller-supplied.
         self.threshold = threshold
         self.unstable_features = []
         self.stable_features = []
+        self.unstable_candidates = [] # [TASK 2D] Soft gate tags
         self.derived_threshold = None
         self.derivation_log = None
 
-    def fit(self, drift_df):
-        """Identify features exceeding the drift threshold.
+    def _get_feature_type(self, feature_name):
+        """Classify feature to apply specific stability rules (Task 2A)."""
+        if any(x in feature_name for x in ['_rate_', '_slope_', '_diff_']):
+            return 'TREND'
+        if any(x in feature_name for x in ['_std_', '_volatility_']):
+            return 'VOLATILITY'
+        return 'LEVEL'
 
-        If self.threshold is None, derives it from the KS-statistic distribution
-        using IQR-based outlier detection.
-        """
+    def fit(self, drift_df, protected_cols=None):
         ks_vals = drift_df['ks_stat'].dropna().values
+        protected_cols = set(protected_cols) if protected_cols else set()
 
         if self.threshold is None:
-            # [WHY_THIS_CHANGE] Adaptive KS threshold derivation
-            # Problem: No threshold provided → old code would crash or use 0.25 default.
-            # Root Cause: Hardcoded default.
-            # Decision: Derive from IQR of the KS distribution.
             if len(ks_vals) >= 4:
                 q1 = float(np.percentile(ks_vals, 25))
                 q3 = float(np.percentile(ks_vals, 75))
                 iqr = q3 - q1
                 derived = float(np.clip(q3 + 1.5 * iqr, 0.05, 0.99))
             else:
-                # Fallback: median of KS values when sample too small for IQR
                 derived = float(np.median(ks_vals)) if len(ks_vals) > 0 else 0.25
-                logger.warning(
-                    "[STABILITY_FILTER] Too few features for IQR derivation. "
-                    "Using median KS = {:.4f} as threshold.".format(derived)
-                )
             self.derived_threshold = derived
-            self.derivation_log = (
-                "IQR outlier detection on KS distribution "
-                "(n={}, Q3={:.4f}, IQR={:.4f}) -> Q3+1.5*IQR = {:.4f} [clip 0.05-0.99]".format(
-                    len(ks_vals),
-                    np.percentile(ks_vals, 75) if len(ks_vals) >= 4 else float('nan'),
-                    (np.percentile(ks_vals, 75) - np.percentile(ks_vals, 25)) if len(ks_vals) >= 4 else float('nan'),
-                    derived
-                )
-            )
             effective_threshold = derived
-            logger.info("[STABILITY_FILTER] Derived adaptive threshold={:.4f} | {}".format(
-                derived, self.derivation_log))
         else:
             effective_threshold = self.threshold
             self.derived_threshold = self.threshold
-            self.derivation_log = "Caller-supplied threshold={:.4f}".format(self.threshold)
-            logger.info("[STABILITY_FILTER] Using caller-supplied threshold={:.4f}".format(self.threshold))
 
-        self.unstable_features = drift_df[drift_df['ks_stat'] > effective_threshold]['feature'].tolist()
-        self.stable_features = drift_df[drift_df['ks_stat'] <= effective_threshold]['feature'].tolist()
+        final_unstable = []
+        self.unstable_candidates = []
+        
+        for idx, row in drift_df.iterrows():
+            f = row['feature']
+            ks = row['ks_stat']
+            tr_std = row.get('tr_std', 1.0)
+            
+            f_type = self._get_feature_type(f)
+            
+            # [TASK 2] Tier 1A: Hard Filter (Catastrophic Features)
+            if ks > 0.85 or tr_std < 1e-5:
+                logger.warning(f"[STABILITY_TIER1A_DROP] {f} dropped due to catastrophic drift or zero variance (KS={ks:.4f}, STD={tr_std:.4f})")
+                final_unstable.append(f)
+                continue
+                
+            # [TASK 2] Tier 1B: Danger Zone
+            # No adjusted_KS bias. Pure global thresholding.
+            thresh = effective_threshold
+            
+            if ks > thresh:
+                # [TASK 2 & 4] Tier 2: Soft Gate (Danger Zone)
+                # We tag them as unstable_candidates. They will require 2x strict validation downstream.
+                self.unstable_candidates.append(f)
+                logger.info(f"[STABILITY_TIER1B_DANGER] {f} (Type: {f_type}) flagged as unstable_candidate (KS={ks:.4f} > {thresh:.4f})")
+                
+        self.unstable_features = final_unstable
+        self.stable_features = drift_df[~drift_df['feature'].isin(self.unstable_features) & ~drift_df['feature'].isin(self.unstable_candidates)]['feature'].tolist()
 
-        logger.info("[STABILITY_FILTER] Identified {} unstable features (KS > {:.4f})".format(
-            len(self.unstable_features), effective_threshold))
-        logger.info("[STABILITY_FILTER] Top unstable: {}".format(self.unstable_features[:5]))
+        logger.info("[STABILITY_FILTER] Identified {} perfectly stable, {} unstable_candidates, {} catastrophic drops".format(
+            len(self.stable_features), len(self.unstable_candidates), len(self.unstable_features)))
 
     def transform(self, features):
         """Filter list of features to exclude unstable ones."""
-        return [f for f in features if f not in self.unstable_features]
+        # Because we use a soft gate, we DO NOT filter them out here anymore.
+        # They are passed downstream.
+        return features

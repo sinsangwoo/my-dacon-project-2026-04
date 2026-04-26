@@ -15,6 +15,21 @@ import pickle
 from sklearn.metrics import mean_absolute_error
 from .config import Config
 
+class NumpyEncoder(json.JSONEncoder):
+    def default(self, obj):
+        if isinstance(obj, np.integer):
+            return int(obj)
+        if isinstance(obj, np.floating):
+            return float(obj)
+        if isinstance(obj, np.ndarray):
+            return obj.tolist()
+        return super(NumpyEncoder, self).default(obj)
+
+def save_json(data, path, indent=2):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
+        json.dump(data, f, indent=indent, cls=NumpyEncoder, ensure_ascii=False)
+
 def assert_artifact_exists(path, description="Artifact"):
     """Strictly enforces that a required artifact exists.
     If it does not exist, raises a RuntimeError to prevent silent fallbacks.
@@ -252,9 +267,7 @@ def validate_submission(df, sample_df, logger):
 
 def save_submission_trace(trace_data, path):
     """Save forensic trace of submission generation."""
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(trace_data, f, indent=2)
+    save_json(trace_data, path)
 
 def preserve_fail_case(file_path, run_id):
     """Copy failed submission to metadata/failed_submissions/ (v11.0)."""
@@ -633,15 +646,6 @@ class DriftShieldScaler:
             x = np.nan_to_num(x, nan=s['mean'], posinf=s['p99'], neginf=s['p1'])
             
             # 1. Clip (Preserve original scale but bound outliers)
-            clipped_mask = (x > s['p99']) | (x < s['p1'])
-            n_clipped = np.sum(clipped_mask)
-            clip_pct = n_clipped / len(x)
-            
-            self.clipping_ratios[col] = clip_pct
-            
-            if clip_pct > 0.05:
-                self.logger.warning(f"[CLIPPING_MONITOR] High clipping: {col}={clip_pct:.2%}")
-            
             # [WHY_THIS_DESIGN] Outlier Clipping
             # Observed Data Behavior: Heavy-tailed distribution in delay-related features.
             # Why P1/P99: Captures 98% of variance while suppressing extreme sensor noise 
@@ -649,35 +653,12 @@ class DriftShieldScaler:
             # Sensitivity: P95 is too aggressive (loses real spikes); P99.9 preserves too much noise.
             x = np.clip(x, s['p1'], s['p99'])
             
-            # [PHASE 5: VARIANCE RESTORATION]
-            # We NO LONGER normalize here. Normalization is a separate responsibility.
-            # We NO LONGER soft-clip (log suppression) here.
-            
-            # [PHASE 5: ASSERT REAL VARIANCE]
-            # [STRATEGY 4] Compare post-clip std against fit-time clipped std (not raw std).
-            # [WHY_THIS_CHANGE] Old code: ratio = std_after / s['std'] — this compares
-            #   clipped output to unclipped baseline, which ALWAYS shows compression
-            #   for heavy-tailed features. That is expected, not a defect.
-            # [ROOT_CAUSE] s['std'] includes extreme outlier contribution. After P1/P99
-            #   clip, outlier contribution is removed → std drops → false alarm.
-            # [EXPECTED_IMPACT] Genuine distribution shift still detected (transform data
-            #   has fundamentally different clipped variance than fit data).
-            std_after = np.std(x) + 1e-9
-            clipped_std_baseline = s.get('clipped_std', s['std']) + 1e-9
-            ratio = std_after / clipped_std_baseline
-            
-            if ratio < 0.6:
-                self.logger.error(f"!!! [VARIANCE_COMPRESSION] {col} ratio={ratio:.4f} (vs clipped baseline) !!!")
-            
             df[col] = x
-        # [AXIS3_FIX] 이중 return 제거. 두 번째 return df는 데드 코드이며,
-        # 향후 두 return 사이에 로직 삽입 시 의도치 않은 흐름이 발생할 수 있다.
         return df
 
     def save(self, path):
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.stats, f, indent=2)
+        save_json(self.stats, path)
+        self.logger.info(f"[DRIFT_SHIELD] Scaler stats saved to {path}")
 
     @classmethod
     def load(cls, path):

@@ -5,7 +5,7 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
-from .utils import get_logger
+from .utils import get_logger, save_json
 
 class ForensicLogger:
     """Forensic Logging System for Model Failure Analysis.
@@ -73,8 +73,7 @@ class ForensicLogger:
             base_path = os.path.join(self.log_dir, f"forensic_{section.lower()}")
             
             # Save JSON
-            with open(f"{base_path}.json", "w") as f:
-                json.dump(data, f, indent=4, default=str)
+            save_json(data, f"{base_path}.json", indent=4)
                 
             # Save TXT (Summary view) - Pretty format
             with open(f"{base_path}.txt", "w") as f:
@@ -159,8 +158,7 @@ class ForensicLogger:
             history = history[-100:]
             
         try:
-            with open(self.audit_path, "w") as f:
-                json.dump(history, f, indent=4)
+            save_json(history, self.audit_path, indent=4)
         except Exception as e:
             self.logger.warning(f"[AUDIT_SAVE_ERR] Could not save audit history: {str(e)}")
 

@@ -27,6 +27,7 @@ import logging
 import os
 from dataclasses import dataclass, field, asdict
 from typing import Dict, List, Optional, Any
+from .utils import save_json
 
 logger = logging.getLogger(__name__)
 
@@ -178,9 +179,7 @@ class FeatureDropRegistry:
 
     def save(self, path: str):
         """Persist registry to a JSON file for cross-phase consumption."""
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        save_json(self.to_dict(), path)
         logger.info(f"[REGISTRY] Saved to {path}")
 
     @classmethod
@@ -258,9 +257,7 @@ class PruningManifest:
         return asdict(self)
 
     def save(self, path: str):
-        os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(self.to_dict(), f, indent=2, ensure_ascii=False)
+        save_json(self.to_dict(), path)
         logger.info(f"[PRUNING_MANIFEST] Saved to {path}")
 
     @classmethod

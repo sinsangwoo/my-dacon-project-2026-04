@@ -4,6 +4,7 @@ import logging
 import numpy as np
 import pandas as pd
 from datetime import datetime
+from .utils import save_json
 
 logger = logging.getLogger(__name__)
 
@@ -31,8 +32,7 @@ class ExperimentIntelligence:
             import shutil
             shutil.copy2(self.registry_path, self.registry_path + ".bak")
             
-        with open(self.registry_path, 'w', encoding='utf-8') as f:
-            json.dump(self.registry, f, indent=2, ensure_ascii=False)
+        save_json(self.registry, self.registry_path)
 
     def log_experiment_audit(self, run_id, metrics, adv_auc, risk_score, fold_stats=None):
         """
@@ -53,8 +53,7 @@ class ExperimentIntelligence:
         # [MISSION: ARTIFACT ISOLATION] Save run-local report PRIMARY
         report_path = f"logs/{run_id}/validation_report.json"
         os.makedirs(os.path.dirname(report_path), exist_ok=True)
-        with open(report_path, "w") as f:
-            json.dump(run_data, f, indent=2)
+        save_json(run_data, report_path)
             
         # Global Registry Update (Aggregator)
         self.registry["runs"].append(run_data)

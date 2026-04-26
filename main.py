@@ -24,7 +24,8 @@ from src.utils import (
     build_submission,
     calculate_std_ratio,
     build_metrics,
-    calculate_risk_score
+    calculate_risk_score,
+    save_json
 )
 from src.intelligence import ExperimentIntelligence
 from src.data_loader import (
@@ -82,8 +83,7 @@ def initialize_run(phase):
             except:
                 continue
             
-    with open(f"{Config.SUMMARY_DIR}/config_snapshot.json", "w") as f:
-        json.dump(config_snap, f, indent=2)
+    save_json(config_snap, f"{Config.SUMMARY_DIR}/config_snapshot.json")
 
 def run_phase(phase, mode, smoke_test=False):
     Config.MODE = mode
@@ -151,8 +151,7 @@ def run_phase(phase, mode, smoke_test=False):
                 "std": float(train[Config.TARGET].std()), 
                 "p99": float(np.quantile(train[Config.TARGET], 0.99))
             }
-            with open(f'{Config.PROCESSED_PATH}/train_stats.json', 'w') as f:
-                json.dump(stats, f, indent=2)
+            save_json(stats, f'{Config.PROCESSED_PATH}/train_stats.json')
 
         elif phase == '2.5_drift_audit':
             train_base = pd.read_pickle(f'{Config.PROCESSED_PATH}/train_base.pkl')
@@ -164,16 +163,18 @@ def run_phase(phase, mode, smoke_test=False):
             audit.save_report(drift_df, f"{Config.SUMMARY_DIR}/distribution/drift_audit_raw.csv")
             
             # Filter unstable features
+            from src.data_loader import get_protected_candidates
+            protected_cols = get_protected_candidates(train_base.columns)
+            
             filter = FeatureStabilityFilter(threshold=Config.STABILITY_THRESHOLD)
-            filter.fit(drift_df)
+            filter.fit(drift_df, protected_cols=protected_cols)
             
             # Save stability mask
             stability_manifest = {
                 "stable_features": filter.stable_features,
                 "unstable_features": filter.unstable_features
             }
-            with open(f'{Config.PROCESSED_PATH}/stability_manifest.json', 'w') as f:
-                json.dump(stability_manifest, f, indent=2)
+            save_json(stability_manifest, f'{Config.PROCESSED_PATH}/stability_manifest.json')
             
             logger.info(f"[DRIFT_AUDIT] {len(filter.stable_features)} stable features identified.")
 

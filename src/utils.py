@@ -585,11 +585,35 @@ class DriftShieldScaler:
             
             if len(series) == 0: continue
             
+            p1 = float(np.quantile(series, 0.01))
+            p99 = float(np.quantile(series, 0.99))
+            
+            # [STRATEGY 4 — VARIANCE-AWARE FEATURE FILTERING]
+            # [WHY_THIS_CHANGE] Compute clipped_std at fit time as the proper baseline
+            #   for transform-time variance comparison.
+            # [ROOT_CAUSE] Forensic PROOF 1 showed that the old check compared
+            #   post-clip std to pre-clip std (raw std). For heavy-tailed features
+            #   (rate_1 with min=-220, max=1), pre-clip std is dominated by extreme
+            #   outliers. After clipping to P1/P99, std drops by 60-80% — this is
+            #   the INTENDED behavior of clipping, not a defect.
+            #   The old check flagged every successful clip as VARIANCE_COMPRESSION.
+            # [WHY_NOT_ALTERNATIVES]
+            #   - Remove the check entirely: Loses genuine drift detection capability.
+            #   - Use post-clip std threshold: Doesn't adapt to feature scale.
+            #   - Compute clipped_std at fit time: Establishes the CORRECT baseline.
+            #     If transform-time clipped std deviates from fit-time clipped std,
+            #     that indicates genuine distribution shift, not expected clip behavior.
+            # [EXPECTED_IMPACT] VARIANCE_COMPRESSION errors eliminated for features
+            #   where compression is caused by intended clipping. Genuine drift
+            #   (e.g., test distribution fundamentally different) still detected.
+            clipped_series = np.clip(series, p1, p99)
+            
             self.stats[col] = {
-                "p1": float(np.quantile(series, 0.01)),
-                "p99": float(np.quantile(series, 0.99)),
+                "p1": p1,
+                "p99": p99,
                 "mean": float(series.mean()),
                 "std": float(series.std()),
+                "clipped_std": float(np.std(clipped_series)),
             }
 
     def transform(self, df, feature_cols):
@@ -630,12 +654,20 @@ class DriftShieldScaler:
             # We NO LONGER soft-clip (log suppression) here.
             
             # [PHASE 5: ASSERT REAL VARIANCE]
+            # [STRATEGY 4] Compare post-clip std against fit-time clipped std (not raw std).
+            # [WHY_THIS_CHANGE] Old code: ratio = std_after / s['std'] — this compares
+            #   clipped output to unclipped baseline, which ALWAYS shows compression
+            #   for heavy-tailed features. That is expected, not a defect.
+            # [ROOT_CAUSE] s['std'] includes extreme outlier contribution. After P1/P99
+            #   clip, outlier contribution is removed → std drops → false alarm.
+            # [EXPECTED_IMPACT] Genuine distribution shift still detected (transform data
+            #   has fundamentally different clipped variance than fit data).
             std_after = np.std(x) + 1e-9
-            # Since we no longer normalize, std_after should be close to std_before (s['std'])
-            ratio = std_after / (s['std'] + 1e-9)
+            clipped_std_baseline = s.get('clipped_std', s['std']) + 1e-9
+            ratio = std_after / clipped_std_baseline
             
             if ratio < 0.6:
-                self.logger.error(f"!!! [VARIANCE_COMPRESSION] {col} ratio={ratio:.4f} !!!")
+                self.logger.error(f"!!! [VARIANCE_COMPRESSION] {col} ratio={ratio:.4f} (vs clipped baseline) !!!")
             
             df[col] = x
         # [AXIS3_FIX] 이중 return 제거. 두 번째 return df는 데드 코드이며,

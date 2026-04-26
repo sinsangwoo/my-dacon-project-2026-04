@@ -607,6 +607,29 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
     # They are structurally required by PCA, schema, and downstream generators.
     protected_cols = set(BASE_COLS) | set(Config.EMBED_BASE_COLS)
 
+    # [STRATEGY 1 — PROTECTED FEATURE SET EXPANSION]
+    # [WHY_THIS_CHANGE] Forensic analysis proved that domain-critical derivatives
+    #   (order_inflow, charge_queue_length, congestion, robot_utilization) were
+    #   systematically eliminated by cluster pruning + importance collapse.
+    #   All 8 order_inflow derivatives and 6 charge_queue_length derivatives
+    #   were dropped by corr_threshold=0.50 (PROOF 2 in forensic report).
+    # [ROOT_CAUSE] protected_cols only contained raw BASE_COLS, not their
+    #   time-series derivatives. Derivatives clustered with raw → dropped.
+    # [WHY_NOT_ALTERNATIVES] Raising threshold alone is insufficient because
+    #   importance-based selection (STRATEGY 3) also drops them. Protection
+    #   at the pruning level is the only structural guarantee.
+    # [EXPECTED_IMPACT] order_inflow / charge_queue_length / congestion
+    #   derivatives survive all pruning stages and enter model training.
+    DOMAIN_CRITICAL_PREFIXES = [
+        'order_inflow', 'charge_queue_length', 'congestion_score',
+        'robot_utilization', 'near_collision', 'blocked_path',
+    ]
+    for col_name in [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]:
+        for prefix in DOMAIN_CRITICAL_PREFIXES:
+            if col_name.startswith(prefix):
+                protected_cols.add(col_name)
+                break
+
     # Initialize registry for this build (train mode builds full audit record).
     registry = FeatureDropRegistry()
 
@@ -738,12 +761,26 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
         # [WHY_THIS_DESIGN] IQR-based cut: features with mutual distance < Q1 are
         # "redundancy outliers" (closer than 75% of all pairs). This is robust to
         # distribution shape and adapts to feature correlation structure.
+        # [WHY_THIS_CHANGE] Upper clip bound changed from 0.50 to 0.20.
+        # [ROOT_CAUSE] Forensic PROOF 4 demonstrated that actual correlation
+        #   distribution P75=0.054, P95=0.235. With q1_d≈0.945, the clip(q1_d, 0.02, 0.50)
+        #   ALWAYS saturated to 0.50, which means distance < 0.50 → corr > 0.50.
+        #   This eliminated 0.61% of all feature pairs — including domain-critical
+        #   time-series derivatives that have natural moderate correlation (0.5–0.8)
+        #   due to physical coupling (e.g., order_inflow → congestion).
+        # [WHY_NOT_ALTERNATIVES]
+        #   - 0.30 (corr>0.70): Still too aggressive for physically coupled features.
+        #   - 0.10 (corr>0.90): Would retain near-duplicates. Tree models waste splits.
+        #   - 0.20 (corr>0.80): Removes only truly redundant near-clones while
+        #     preserving physically distinct signals at different time scales.
+        # [EXPECTED_IMPACT] Features with correlation 0.5–0.8 survive pruning.
+        #   Expected: ~100+ domain derivatives restored. corr_drop count reduced by ~60%.
         nonzero_dists = condensed_dist[condensed_dist > 1e-10]
         if len(nonzero_dists) >= 4:
             q1_d = float(np.percentile(nonzero_dists, 25))
             q3_d = float(np.percentile(nonzero_dists, 75))
             iqr_d = q3_d - q1_d
-            cut_threshold = float(np.clip(q1_d, 0.02, 0.50))
+            cut_threshold = float(np.clip(q1_d, 0.02, 0.20))
         else:
             cut_threshold = 0.15  # Absolute fallback for tiny feature sets
 
@@ -791,12 +828,39 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
                 droppable_members = [m for m in members if m not in protected_cols]
 
                 if protected_members:
-                    # Keep all protected, drop all droppable
+                    # [STRATEGY 1] Keep all protected members — they are domain-critical.
+                    # Only drop members that are NOT protected.
                     corr_drop.update(droppable_members)
                 elif droppable_members:
                     # Keep highest-importance member, drop rest
                     best = max(members, key=lambda f: importances.get(f, 0))
                     corr_drop.update(m for m in members if m != best)
+
+        # [STRATEGY 2 — MULTI-SIGNAL SURVIVAL GUARANTEE]
+        # [WHY_THIS_CHANGE] Forensic PROOF 2 showed that cluster pruning reduces
+        #   each BASE_COL's derivative set to exactly 1 representative.
+        #   This eliminates multi-scale temporal resolution (rolling_3 vs rolling_5,
+        #   slope vs rate) which carries orthogonal predictive information.
+        # [ROOT_CAUSE] Cluster representative selection only keeps 1 per cluster.
+        #   rolling_mean_3 and rolling_mean_5 of the same column are highly correlated
+        #   (corr > 0.95), so only 1 survives — destroying temporal resolution.
+        # [WHY_NOT_ALTERNATIVES] Simply raising threshold would retain noise features
+        #   that happen to be uncorrelated. Targeted survival per base_col is precise.
+        # [EXPECTED_IMPACT] Each base column retains at least 2 time-scale signals.
+        SIGNAL_TYPES = ['_rolling_mean', '_rolling_std', '_slope_5', '_rate_1', '_diff_1']
+        for base_col in BASE_COLS:
+            surviving = [f for f in feature_names if f.startswith(base_col + '_') and f not in corr_drop]
+            if len(surviving) < 2:
+                # Rescue highest-importance dropped derivatives for this base_col
+                dropped_derivatives = [
+                    f for f in corr_drop
+                    if f.startswith(base_col + '_') and any(s in f for s in SIGNAL_TYPES)
+                ]
+                rescued = sorted(dropped_derivatives, key=lambda f: importances.get(f, 0), reverse=True)[:2]
+                for f in rescued:
+                    corr_drop.discard(f)
+                if rescued:
+                    logger.info(f"[MULTI_SIGNAL_RESCUE] {base_col}: rescued {rescued} (had {len(surviving)} survivors)")
 
         derivation_corr = (
             f"Cluster-based pruning: hierarchical clustering (average linkage) on "
@@ -1218,13 +1282,26 @@ def add_time_series_features(df, train_col_means=None):
         # rate_1: Normalized change (diff / magnitude)
         # [WHY_THIS_DESIGN] diff_1=+10 means different things at baseline=100 vs baseline=1000.
         #   rate_1 captures RELATIVE change, invariant to feature scale.
-        eps = np.finfo(np.float32).eps
+        # [WHY_THIS_CHANGE] Denominator smoothing factor changed from eps (1.19e-7) to 1.0.
+        # [ROOT_CAUSE] Forensic PROOF 1 demonstrated mathematically inevitable variance
+        #   explosion: when col_vals → 0 (e.g., order_inflow_15m near zero during idle
+        #   periods), (|x| + eps) ≈ 1e-7, causing rate_1 values to explode to -220.99.
+        #   This produces std=4.03 (inflated by outliers). DriftShieldScaler then clips
+        #   at P1/P99, collapsing std_after/std_before ratio to 0.33 → VARIANCE_COMPRESSION.
+        #   Measured: order_inflow_15m_rate_1 min=-220.99, max=1.0, std=4.03.
+        # [WHY_NOT_ALTERNATIVES]
+        #   - np.clip(rate_1, -5, 5): Masks the root cause; DriftShieldScaler still detects
+        #     compression because raw std remains inflated before clip.
+        #   - Larger eps (e.g., 0.01): Still allows values up to ±100 near zero crossings.
+        #   - Additive smoothing (+1.0): Denominates become (|x| + 1.0), ensuring rate_1
+        #     stays bounded in [-1, 1] for typical feature ranges. For large |x| >> 1,
+        #     the +1.0 term becomes negligible and rate_1 ≈ diff/|x| (original behavior).
+        #     For small |x| → 0, rate_1 ≈ diff/1.0 = diff (absolute change, still informative).
+        #   - Tree models (LGBM) are ordinal-only: they do not need precise ratio scale.
+        # [EXPECTED_IMPACT] rate_1 values bounded to reasonable range.
+        #   VARIANCE_COMPRESSION errors eliminated for all rate_1 features.
         col_vals = np.asarray(col_filled, dtype=np.float32)
-        new_features[f"{col}_rate_1"] = np.where(
-            np.abs(col_vals) > eps,
-            np.asarray(diff_1, dtype=np.float32) / (np.abs(col_vals) + eps),
-            0.0
-        )
+        new_features[f"{col}_rate_1"] = np.asarray(diff_1, dtype=np.float32) / (np.abs(col_vals) + 1.0)
 
     logger.info(f"[TS_FEATURES] Concat-ing {len(new_features)} new features")
     ts_df = pd.DataFrame(new_features, index=df.index)

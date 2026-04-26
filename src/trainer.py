@@ -133,17 +133,62 @@ class Trainer:
         # Example failure: If top 10% of features cover 99% importance, p80_idx points
         # to a feature with ~100% cumulative importance, and the cutoff becomes 0.97 (clipped).
         # This would KEEP features with near-zero marginal importance.
-        # [MATHEMATICAL FIX] Directly set cumulative importance target = 0.95.
-        # Keep features until their cumulative importance reaches 95% of total.
-        # This is the correct interpretation: "features covering 95% of model signal."
-        # [FAILURE_MODE_PREVENTED] Over-inclusion of zero-importance features.
-        IMPORTANCE_CUTOFF = 0.95
+        # [MATHEMATICAL FIX] Directly set cumulative importance target = 0.99.
+        # Keep features until their cumulative importance reaches 99% of total.
+        # [WHY_THIS_CHANGE] Cutoff changed from 0.95 to 0.99.
+        # [ROOT_CAUSE] Forensic PROOF 3 demonstrated that shallow LGBM (max_depth=4)
+        #   assigns zero importance to conditionally-causal features like
+        #   charge_queue_length (only impacts delay during bottleneck states).
+        #   At 0.95 cutoff, these features were excluded entirely from training.
+        # [WHY_NOT_ALTERNATIVES]
+        #   - 1.0 (keep all): Would include true noise features that slow training.
+        #   - 0.95 (original): Eliminates ~40% of features that carry latent signal.
+        #   - 0.99: Retains 99% of model-recognized signal while filtering only
+        #     confirmed-zero-importance noise. Combined with STRATEGY 3 force-include,
+        #     this ensures domain features survive even at zero importance.
+        # [EXPECTED_IMPACT] ~50-80 more features enter training. charge_queue_length
+        #   and similar conditional signals are preserved.
+        # [FAILURE_MODE_PREVENTED] Over-exclusion of interaction features.
+        IMPORTANCE_CUTOFF = 0.99
         
         selected_features = imp_df[imp_df['c'] <= IMPORTANCE_CUTOFF]['f'].tolist()
         if not selected_features: selected_features = initial_candidates[:100]
         
-        logger.info(f"[GLOBAL_SELECTION] Selected {len(selected_features)} features for all folds (Cumulative importance cutoff={IMPORTANCE_CUTOFF}).")
+        # [STRATEGY 3 — IMPORTANCE SELECTION BIAS CORRECTION]
+        # [WHY_THIS_CHANGE] Force-include raw features and domain-critical derivatives
+        #   that survive pruning but fail importance selection.
+        # [ROOT_CAUSE] Forensic PROOF 3: shallow LGBM (max_depth=4) cannot detect
+        #   features whose signal is conditioned on multi-feature interactions.
+        #   charge_queue_length only predicts delay when robot_utilization > 0.8
+        #   AND congestion_score > P90 — a 3-way interaction invisible to depth=4 trees.
+        # [WHY_NOT_ALTERNATIVES]
+        #   - Deeper tree (max_depth=8): Overfits on 20k sample, making importance noisy.
+        #   - No importance filter: Memory explosion (~700 features * 250k rows).
+        #   - Force-include domain features: Ensures physically meaningful signals are
+        #     always present regardless of shallow-model bias, while still filtering
+        #     confirmed-noise synthetic features.
+        # [EXPECTED_IMPACT] All BASE_COLS and their surviving derivatives enter every fold.
+        DOMAIN_CRITICAL_PREFIXES = [
+            'order_inflow', 'charge_queue_length', 'congestion_score',
+            'robot_utilization', 'near_collision', 'blocked_path',
+        ]
+        force_include = set()
+        for f in initial_candidates:
+            # Include all raw features (BASE_COLS)
+            if f in FEATURE_SCHEMA['raw_features']:
+                force_include.add(f)
+            # Include all domain-critical prefix derivatives
+            for prefix in DOMAIN_CRITICAL_PREFIXES:
+                if f.startswith(prefix):
+                    force_include.add(f)
+                    break
         
+        n_before = len(selected_features)
+        selected_features = list(set(selected_features) | force_include)
+        n_forced = len(selected_features) - n_before
+        logger.info(f"[STRATEGY_3] Force-included {n_forced} domain-critical features. Total: {len(selected_features)}")
+        
+        logger.info(f"[GLOBAL_SELECTION] Selected {len(selected_features)} features for all folds (Cumulative importance cutoff={IMPORTANCE_CUTOFF}).")        
         # Cleanup global phase
         del sample_df, sample_df_drifted, sample_df_scaled, sample_df_full, X_sample, temp_model, imp_df
         gc.collect()

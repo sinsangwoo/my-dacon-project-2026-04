@@ -8,6 +8,8 @@ from sklearn.cluster import KMeans
 from sklearn.preprocessing import StandardScaler
 from sklearn.impute import SimpleImputer
 from scipy.stats import rankdata
+from scipy.cluster.hierarchy import linkage, fcluster
+from scipy.spatial.distance import squareform
 
 from .config import Config
 from .schema import FEATURE_SCHEMA, BASE_COLS
@@ -557,11 +559,44 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
     # 1. Temporal Ordering
     df = df.sort_values(by=["scenario_id", "ID"]).reset_index(drop=True)
     
-    # [WHY_THIS_CHANGE] Feature Flow Trace (TASK 5)
+    # [TASK 5/11] Compute train-derived statistics for leakage-free sub-function calls
     logger.info(f"[BUILD_BASE] Initial Count: {len(df.columns)}")
-    df = add_time_series_features(df)
+
+    if is_train_mode:
+        # TRAIN: compute col means from train df (safe — df IS train)
+        train_col_means = {
+            col: float(df[col].mean()) for col in BASE_COLS
+            if col in df.columns and not df[col].isna().all()
+        }
+        df = add_time_series_features(df, train_col_means=None)  # None = compute internally
+    else:
+        # TEST: use train-derived means from manifest (zero leakage)
+        train_col_means = pruning_manifest.train_col_means
+        df = add_time_series_features(df, train_col_means=train_col_means)
+
     logger.info(f"[BUILD_BASE] After TS Expansion: {len(df.columns)}")
-    df = add_extreme_detection_features(df)
+
+    if is_train_mode:
+        # TRAIN: compute extreme quantiles from train
+        key_extreme_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'near_collision_15m']
+        extreme_quantiles = {}
+        for c in key_extreme_cols:
+            if c in df.columns:
+                extreme_quantiles[c] = float(df[c].quantile(0.95))
+        # Also compute util_rel_p90 after TS features are generated
+        util_rel_col = f'robot_utilization_rel_to_mean_5'  # generated inside add_extreme
+        # We'll let add_extreme compute it in train mode (extreme_quantiles=None)
+        df = add_extreme_detection_features(df, extreme_quantiles=None)
+        # Capture util_rel_p90 from the generated data for manifest
+        if util_rel_col in df.columns:
+            util_rel_clean = df[util_rel_col].dropna().values
+            extreme_quantiles['util_rel_p90'] = float(
+                np.quantile(util_rel_clean, 0.90) if len(util_rel_clean) > 0 else 1.2
+            )
+    else:
+        extreme_quantiles = pruning_manifest.extreme_quantiles
+        df = add_extreme_detection_features(df, extreme_quantiles=extreme_quantiles)
+
     logger.info(f"[BUILD_BASE] After Extreme Expansion: {len(df.columns)}")
     
     # 3. Order Restoration
@@ -594,7 +629,16 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
         # Why 2-Sigma Jump: Identifies the largest statistical discontinuity in data quality.
         # Mathematical Justification: Outlier detection in the jump distribution (1st order diff).
         # Sensitivity: 1.5*std is too sensitive (drops clean features); 3*std ignores real gaps.
-        nan_ratios_sorted = df.isna().mean().sort_values()
+        # [TASK 1 — NaN Gap Detection Logic Recovery]
+        # [WHY_THIS_DESIGN] nan_ratios_sorted MUST use the same feature set as nan_ratios.
+        # [CODE_EVIDENCE] Previously: nan_ratios_sorted = df.isna().mean().sort_values()
+        #   This operated on ALL df columns including ID columns (ID, scenario_id, layout_id).
+        #   nan_ratios (line 589) operates on runtime_raw_current which EXCLUDES ID columns.
+        #   At line 606: gap_threshold = nan_ratios[max_diff_idx] — if max_diff_idx was an
+        #   ID column name, this would KeyError. Even without KeyError, including ID columns
+        #   in the sorted distribution biases gap detection (ID columns have 0% NaN, skewing jumps).
+        # [FAILURE_MODE_PREVENTED] KeyError on ID column lookup + biased gap threshold.
+        nan_ratios_sorted = nan_ratios.sort_values()
         diffs = nan_ratios_sorted.diff().dropna()
         if len(diffs) > 0:
             mean_jump = diffs.mean()
@@ -649,40 +693,120 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
                                      adaptive_nan_threshold, derivation_nan)
 
     # ------------------------------------------------------------------
-    # [CORR_PRUNE]
-    # [CONTEXT] 48.7% of features were found highly correlated (>0.98).
-    # This lightweight sample-based pruning removes redundant features
-    # keeping the one with highest variance in each correlated pair.
-    # If removed: model trains on massively redundant feature space, wasting
-    # memory and amplifying noise.
+    # [TASK 10 — CLUSTER-BASED REDUNDANCY REMOVAL]
+    # [WHY_THIS_DESIGN] Replaced P99 correlation threshold with graph-based clustering.
+    # [CODE_EVIDENCE] Previous approach: adaptive_corr_threshold = np.percentile(upper_tri, 99)
+    #   P99 is unstable: depends on correlation distribution shape, which varies with
+    #   feature count and scale. A dataset with 200 vs 400 features produces entirely
+    #   different P99 values even if underlying redundancy is identical.
+    # [WHY_THIS_APPROACH] Hierarchical clustering on correlation distance:
+    #   1. Convert |corr| to distance: D = 1 - |corr| (0 = identical, 1 = uncorrelated)
+    #   2. Average-linkage clustering (robust to outlier correlations)
+    #   3. Cut threshold derived from IQR of pairwise distances (data-driven)
+    #   4. Within each cluster: keep representative with highest LightGBM importance
+    # [FAILURE_MODE_PREVENTED] Arbitrary P99 threshold causing over/under-pruning.
     # ------------------------------------------------------------------
     runtime_raw_current = [c for c in df.columns if c not in Config.ID_COLS and c != Config.TARGET]
     n_sample = min(CORR_SAMPLE_SIZE_CAP, len(df))
-    sample_df = df[runtime_raw_current].sample(n=n_sample, random_state=42).astype("float32")
+    # [TASK 12 — DETERMINISM] Use fixed random_state for reproducible sampling
+    sample_indices = df.index.to_series().sample(n=n_sample, random_state=42).index
+    sample_df = df.loc[sample_indices, runtime_raw_current].astype("float32")
     # Fill NaN for correlation computation only (does not affect main df)
     sample_filled = sample_df.fillna(sample_df.median())
-    corr_matrix = sample_filled.corr().abs()
+    corr_matrix = sample_filled.corr().abs().fillna(0.0)
     corr_values = corr_matrix.to_numpy(copy=True)
     np.fill_diagonal(corr_values, 0)
 
-    # Find features to drop (keep higher variance in each pair)
     # [CONTEXT] Never prune BASE_COLS or EMBED_BASE_COLS — they are structurally required
     # by PCA reconstructor and schema. Pruning them causes KeyError downstream.
-    variances = sample_filled.var()
-    # [AXIS4_FIX] O(N^2) 이중 루프 대신 numpy 상삼각 행렬 마스킹 최적화
     cols_array = np.array(corr_matrix.columns)
     upper_tri_indices = np.triu_indices_from(corr_values, k=1)
     upper_tri = corr_values[upper_tri_indices]
 
     if is_train_mode:
-        # [WHY_THIS_DESIGN] Correlation Pruning
-        # Observed Data Behavior: P99 correlation is ~0.53 after source-level redesign.
-        # Why P99: Targets only the absolute top 1% of redundant features.
-        # Decision: Hardcode floor removed (RULE 1). Threshold is 100% data-driven.
-        adaptive_corr_threshold = float(np.percentile(upper_tri, 99))
-        derivation_corr = f"Data-driven P99 correlation threshold: {adaptive_corr_threshold:.4f}"
-        
+        # --- STEP 1: Build correlation distance matrix ---
+        # [FAILURE_MODE_PREVENTED] Finite values check for linkage()
+        corr_dist = 1.0 - corr_values
+        np.fill_diagonal(corr_dist, 0)
+        corr_dist = np.clip(corr_dist, 0, 1)  # Numerical safety
+
+        # --- STEP 2: Hierarchical clustering ---
+        condensed_dist = squareform(corr_dist, checks=False)
+        Z = linkage(condensed_dist, method='average')
+
+        # --- STEP 3: Derive cut threshold from distance distribution ---
+        # [WHY_THIS_DESIGN] IQR-based cut: features with mutual distance < Q1 are
+        # "redundancy outliers" (closer than 75% of all pairs). This is robust to
+        # distribution shape and adapts to feature correlation structure.
+        nonzero_dists = condensed_dist[condensed_dist > 1e-10]
+        if len(nonzero_dists) >= 4:
+            q1_d = float(np.percentile(nonzero_dists, 25))
+            q3_d = float(np.percentile(nonzero_dists, 75))
+            iqr_d = q3_d - q1_d
+            cut_threshold = float(np.clip(q1_d, 0.02, 0.50))
+        else:
+            cut_threshold = 0.15  # Absolute fallback for tiny feature sets
+
+        clusters = fcluster(Z, t=cut_threshold, criterion='distance')
+        adaptive_corr_threshold = cut_threshold  # Store for manifest compatibility
+
+        # --- STEP 4: Select cluster representatives ---
+        feature_names = list(cols_array)
+        cluster_map = {}
+        for feat, cid in zip(feature_names, clusters):
+            cluster_map.setdefault(int(cid), []).append(feat)
+
+        multi_member_clusters = {k: v for k, v in cluster_map.items() if len(v) > 1}
+        n_clusters = len(cluster_map)
+        n_multi = len(multi_member_clusters)
+        logger.info(f"[CLUSTER_PRUNE] {n_clusters} clusters found, {n_multi} have >1 member (cut={cut_threshold:.4f})")
+
+        corr_drop = set()
+        if multi_member_clusters:
+            # Use LightGBM importance to select representatives
+            y_sample = None
+            if Config.TARGET in df.columns:
+                y_sample = df.loc[sample_indices, Config.TARGET].values
+
+            if y_sample is not None and len(y_sample) > 0 and not np.isnan(y_sample).all():
+                from lightgbm import LGBMRegressor
+                X_imp = sample_filled.values
+                # [TASK 12] Fixed random_state for determinism
+                imp_model = LGBMRegressor(
+                    n_estimators=50, max_depth=3, verbose=-1, random_state=42
+                )
+                imp_model.fit(X_imp, y_sample)
+                importances = dict(zip(feature_names, imp_model.feature_importances_))
+                del imp_model
+                selection_method = "lgbm_importance"
+            else:
+                # Fallback: use variance as proxy for importance
+                importances = dict(zip(feature_names, sample_filled.var().values))
+                selection_method = "variance_fallback"
+
+            logger.info(f"[CLUSTER_PRUNE] Representative selection method: {selection_method}")
+
+            for cid, members in multi_member_clusters.items():
+                protected_members = [m for m in members if m in protected_cols]
+                droppable_members = [m for m in members if m not in protected_cols]
+
+                if protected_members:
+                    # Keep all protected, drop all droppable
+                    corr_drop.update(droppable_members)
+                elif droppable_members:
+                    # Keep highest-importance member, drop rest
+                    best = max(members, key=lambda f: importances.get(f, 0))
+                    corr_drop.update(m for m in members if m != best)
+
+        derivation_corr = (
+            f"Cluster-based pruning: hierarchical clustering (average linkage) on "
+            f"correlation distance matrix. Cut threshold={cut_threshold:.4f} derived from "
+            f"Q1 of pairwise distances. {n_multi} multi-member clusters resolved via {selection_method if multi_member_clusters else 'N/A'}."
+        )
         supporting_stats = {
+            "n_clusters": n_clusters,
+            "n_multi_clusters": n_multi,
+            "cut_threshold": cut_threshold,
             "corr_P50": float(np.median(upper_tri)),
             "corr_P95": float(np.percentile(upper_tri, 95)),
             "n_pairs": int(len(upper_tri))
@@ -691,50 +815,28 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
     else:
         # TEST MODE: Use threshold from manifest
         adaptive_corr_threshold = pruning_manifest.corr_threshold
-        logger.info("[CORR_PRUNE] TEST mode: applying train-derived threshold={:.4f}".format(adaptive_corr_threshold))
+        logger.info("[CLUSTER_PRUNE] TEST mode: applying train-derived drop list.")
 
     if is_train_mode:
-        high_corr_mask = upper_tri > adaptive_corr_threshold
-        high_corr_pairs = zip(
-            upper_tri_indices[0][high_corr_mask],
-            upper_tri_indices[1][high_corr_mask]
-        )
-        corr_drop = set()
-        for i, j in high_corr_pairs:
-            ci, cj = cols_array[i], cols_array[j]
-            if ci in corr_drop or cj in corr_drop:
-                continue
-            ci_protected = ci in protected_cols
-            cj_protected = cj in protected_cols
-            if ci_protected and cj_protected:
-                continue
-            elif ci_protected:
-                corr_drop.add(cj)
-            elif cj_protected:
-                corr_drop.add(ci)
-            elif variances[ci] < variances[cj]:
-                corr_drop.add(ci)
-            else:
-                corr_drop.add(cj)
+        pass  # corr_drop already computed above
     else:
         # TEST: apply exactly the same columns dropped on train
         corr_drop = set(c for c in pruning_manifest.cols_to_drop_corr if c in df.columns)
 
     if corr_drop:
-        logger.warning("[CORR_PRUNE] Dropping {} highly correlated features (threshold={:.4f})".format(
+        logger.warning("[CLUSTER_PRUNE] Dropping {} redundant features (cluster cut={:.4f})".format(
             len(corr_drop), adaptive_corr_threshold))
         df = df.drop(columns=list(corr_drop))
         # [AXIS1_FIX] 싱글턴 변이 금지, 로컬 드롭셋에 추가
         dropped_features.update(corr_drop)
         if is_train_mode:
-            col_name_to_idx = {name: idx for idx, name in enumerate(cols_array)}
             for col in corr_drop:
-                col_idx = col_name_to_idx.get(col, -1)
+                col_idx = list(cols_array).index(col) if col in cols_array else -1
                 corr_stat = float(corr_values[col_idx].max()) if col_idx >= 0 else float("nan")
                 registry.record_drop(col, "corr_drop", corr_stat,
                                      adaptive_corr_threshold, derivation_corr)
     else:
-        logger.info("[CORR_PRUNE] No highly correlated pairs found.")
+        logger.info("[CLUSTER_PRUNE] No redundant clusters found.")
 
     del sample_df, sample_filled, corr_matrix, corr_values
     gc.collect()
@@ -876,7 +978,11 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
                 "corr_threshold": derivation_corr,
                 "var_threshold": derivation_var,
             },
-            regime_boundaries=None
+            regime_boundaries=None,
+            # [TASK 5] Train-derived column means for causal fallback
+            train_col_means=train_col_means,
+            # [TASK 11] Train-derived extreme quantiles for consistent detection
+            extreme_quantiles=extreme_quantiles
         )
         return df, manifest, registry
     else:
@@ -984,20 +1090,33 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
                 
     return df
 
-def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=None, raw_preds=None):
+def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=None, raw_preds=None, pruning_manifest=None):
     """Legacy entry point for compatibility.
-    
-    [PHASE 2: SSOT SCALING] Added scaler argument to ensure consistent scaling.
+
+    [TASK 3 — MANIFEST CONTRACT RESTORATION]
+    [WHY_THIS_DESIGN] pruning_manifest parameter added to enforce train/test consistency.
+    [CODE_EVIDENCE] Previously: build_base_features(df) was called with NO manifest,
+      meaning this function ALWAYS operated in train mode — recomputing thresholds
+      even for test data. This breaks the manifest contract.
+    [FAILURE_MODE_PREVENTED] Test data computing its own pruning thresholds.
     """
-    df_base = build_base_features(df)
-    
+    if pruning_manifest is not None:
+        df_base = build_base_features(df, pruning_manifest=pruning_manifest)
+    else:
+        # Train mode — compute manifest (caller should capture it if needed)
+        result = build_base_features(df)
+        if isinstance(result, tuple):
+            df_base = result[0]
+        else:
+            df_base = result
+
     # In legacy mode, we still use the global stats if available for 'raw'
     if mode == 'raw':
         from .utils import assert_artifact_exists
         assert_artifact_exists(Config.GLOBAL_STATS_PATH, "Global Stats Cache")
         stats = GlobalStatStore.load(Config.GLOBAL_STATS_PATH)
         df_base = GlobalStatStore.apply_drift_shield(df_base, stats, FEATURE_SCHEMA['raw_features'])
-    
+
     if mode == 'full' and reconstructor is not None:
         # Scale if scaler is provided
         if scaler is not None:
@@ -1009,51 +1128,66 @@ def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=No
     X_df = df_base[valid_features].astype('float32').fillna(0.0)
     return X_df, df_base
 
-def add_time_series_features(df):
+def add_time_series_features(df, train_col_means=None):
     """
-    # [WHY_THIS_DESIGN] Time-Series Redundancy Justification
-    # Problem: rolling_mean_5 and expanding_mean have 98% correlation.
-    # Why keep both: rolling_mean_5 captures "local dynamics" (short-term shifts),
-    #   while expanding_mean captures "long-term bias" (cumulative scenario history).
-    # Why this value (5): Small window for high-frequency sensor updates in 15m intervals.
     [CONTEXT] Generates temporal features per-scenario using rolling/expanding windows.
     NaN production is inherent in shift-based operations (diff, rate, accel) when
     raw data already contains NaN (10-17% in BASE_COLS). This function now fills
     shift-generated NaNs with 0 to prevent NaN compounding through downstream generators.
     If removed: 326+ features would exceed the 5% NaN threshold and corrupt PCA.
-    
-    [TS_CONDITION_GUARD] Memory evaluation (2026-04-24):
-    - 700 raw features × 100K rows × 4 bytes = ~267 MB → SAFE
-    - Conditional TS generation NOT needed (within memory budget)
-    - Decision: APPLIED standard generation with NaN sanitization
+
+    [TASK 5 — CAUSAL FALLBACK LEAKAGE FIX]
+    train_col_means: dict of {col: mean_value} computed on TRAIN data.
+      If None (train mode), computes from df — safe because df IS train.
+      If provided (test mode), uses train-derived means — zero leakage.
+
+    [TASK 7/8/9 — UNDERFITTING RECOVERY + TREND EXPANSION + MULTI-SCALE WINDOWS]
+    Added: rolling_mean_3, rolling_std_3 (short-window 45min state)
+    Added: slope_5 (linear trend direction over 5 steps)
+    Added: rate_1 (magnitude-normalized change)
     """
     logger.info(f"[TS_FEATURES] Adding features to df shape {df.shape}")
     if "timestep_index" not in df.columns:
         df["timestep_index"] = df.groupby("scenario_id").cumcount().astype("int16")
     df["normalized_time"] = (df["timestep_index"] / 24.0).astype("float32")
     df["cold_start_flag"] = 0
-    
+
     new_features = {}
     col_types = infer_feature_types(df, BASE_COLS)
-    
-    # [WHY_THIS_DESIGN] Feature Engineering Minimization (TASK 3)
-    # Problem: Over-engineered feature space (300+ TS features).
-    # Why this structure: Reduced to 3 canonical signals: mean, std, and diff.
-    # Why alternatives rejected: Expanding stats, rates, and slopes were >90% redundant.
-    # Expected impact: Leaner model, faster training, less overfitting risk.
+
+    # [TASK 5] Resolve fallback means: train mode computes, test mode uses manifest
+    if train_col_means is None:
+        # TRAIN MODE: compute from df (which IS the train set — no leakage)
+        fallback_means = {}
+        for col in BASE_COLS:
+            if col in df.columns and not df[col].isna().all():
+                fallback_means[col] = float(df[col].mean())
+            else:
+                fallback_means[col] = 0.0
+    else:
+        # TEST MODE: use train-derived means — zero test distribution leakage
+        fallback_means = train_col_means
+
     for col in BASE_COLS:
         series = df.groupby("scenario_id")[col]
-        
-        # 1. Rolling Stats (State & Stability)
+
+        # [TASK 9] Multi-scale rolling windows: 3 (45min) and 5 (75min)
+        # [WHY_THIS_DESIGN] Different windows capture different dynamics:
+        #   window=3: Responsive to rapid changes (e.g., sudden order spike)
+        #   window=5: Smooths over noise, captures medium-term trends
+        new_features[f"{col}_rolling_mean_3"] = series.rolling(3, min_periods=1).mean().values
+        new_features[f"{col}_rolling_std_3"] = series.rolling(3, min_periods=1).std().values
         new_features[f"{col}_rolling_mean_5"] = series.rolling(5, min_periods=1).mean().values
         new_features[f"{col}_rolling_std_5"] = series.rolling(5, min_periods=1).std().values
-        
-        # 2. Sequential Stats (Trend)
+
+        # Sequential Stats (Trend)
         shift1_raw = series.shift(1)
         is_boundary = shift1_raw.isna().astype('float32').values
         new_features[f"{col}_is_boundary"] = is_boundary
-        
+
         col_type = col_types.get(col, "sensor")
+        col_fallback_mean = fallback_means.get(col, 0.0)
+
         if col_type == "count":
             col_filled = df[col].fillna(0.0)
             shift1 = shift1_raw.fillna(0.0).values
@@ -1062,24 +1196,57 @@ def add_time_series_features(df):
             col_filled = df[col].fillna(causal_past_median)
             shift1 = shift1_raw.fillna(causal_past_median).values
         else:
-            causal_past_mean = series.shift(1).expanding().mean().fillna(df[col].mean() if not df[col].empty else 0.0).fillna(0.0).reset_index(level=0, drop=True)
+            # [TASK 5 — LEAKAGE FIX] Use train-derived fallback_mean instead of df[col].mean()
+            # [CODE_EVIDENCE] Previously: .fillna(df[col].mean()) leaked test distribution
+            # [FAILURE_MODE_PREVENTED] Test statistics injected into feature values
+            causal_past_mean = series.shift(1).expanding().mean().fillna(col_fallback_mean).fillna(0.0).reset_index(level=0, drop=True)
             col_filled = df[col].fillna(causal_past_mean)
             shift1 = shift1_raw.fillna(causal_past_mean).values
-        
-        new_features[f"{col}_diff_1"] = col_filled - shift1
+
+        diff_1 = col_filled - shift1
+        new_features[f"{col}_diff_1"] = diff_1
+
+        # [TASK 8 — TREND EXPANSION]
+        # slope_5: Linear trend direction over 5 steps via rolling regression
+        # [WHY_THIS_DESIGN] diff_1 captures instantaneous change only.
+        #   slope_5 captures sustained direction over 75min, complementing diff_1.
+        rm5_vals = new_features[f"{col}_rolling_mean_5"]
+        shift5_rm5 = series.shift(4).rolling(5, min_periods=1).mean().values
+        # Approximation: (current_mean - lagged_mean) / window
+        new_features[f"{col}_slope_5"] = (np.asarray(rm5_vals) - np.asarray(shift5_rm5)) / 5.0
+
+        # rate_1: Normalized change (diff / magnitude)
+        # [WHY_THIS_DESIGN] diff_1=+10 means different things at baseline=100 vs baseline=1000.
+        #   rate_1 captures RELATIVE change, invariant to feature scale.
+        eps = np.finfo(np.float32).eps
+        col_vals = np.asarray(col_filled, dtype=np.float32)
+        new_features[f"{col}_rate_1"] = np.where(
+            np.abs(col_vals) > eps,
+            np.asarray(diff_1, dtype=np.float32) / (np.abs(col_vals) + eps),
+            0.0
+        )
 
     logger.info(f"[TS_FEATURES] Concat-ing {len(new_features)} new features")
     ts_df = pd.DataFrame(new_features, index=df.index)
-    
+
     # [STRUCTURAL_INTEGRITY] Avoid duplicate columns
     overlap = [c for c in ts_df.columns if c in df.columns]
     if overlap:
         logger.info(f"[TS_FEATURES] Dropping {len(overlap)} overlapping columns from ts_df")
         ts_df = ts_df.drop(columns=overlap)
-        
+
     return pd.concat([df, ts_df], axis=1)
 
-def add_extreme_detection_features(df):
+def add_extreme_detection_features(df, extreme_quantiles=None):
+    """
+    [TASK 11 — EXTREME QUANTILE CONSISTENCY]
+    extreme_quantiles: dict of {col: q95_value} from train. If None, compute from df.
+    [TASK 2 — DUPLICATE INTERACTION REMOVAL]
+    [CODE_EVIDENCE] Lines 1202-1205 and 1219-1225 both injected identical interaction
+    features. The second block (with WHY_THIS_DESIGN comment) overwrote the first with
+    the exact same computation. Removed the duplicate second block.
+    Statement: "No duplicate feature computation exists after this fix."
+    """
     new_features = {}
     col_types = infer_feature_types(df, BASE_COLS)
     # [WHY_THIS_DESIGN] Context Signal Minimization
@@ -1092,49 +1259,60 @@ def add_extreme_detection_features(df):
         rm5 = series.rolling(5, min_periods=1).mean().values
         new_features[f"{col}_rel_to_mean_5"] = np.where(np.abs(rm5) > eps, (df[col] - rm5) / (rm5 + eps), 0.0)
 
-    # Interactions
+    # [WHY_THIS_DESIGN] Manual Interaction Justification
+    # Problem: Linear models miss the multiplicative effect of load and complexity.
+    # Why these 3: Represent core bottleneck intersections (Inflow x Util, Weight x Inflow).
+    # [TASK 2] Single authoritative injection point — no duplicates.
     new_features['inter_order_inflow_15m_x_robot_utilization'] = df['order_inflow_15m'] * df['robot_utilization']
     new_features['inter_heavy_item_ratio_x_order_inflow_15m'] = df['heavy_item_ratio'] * df['order_inflow_15m']
     new_features['inter_heavy_item_ratio_x_robot_utilization'] = df['heavy_item_ratio'] * df['robot_utilization']
-    
+
     # Early Warning
     # [WHY_THIS_DESIGN] Justified Heuristic for Early Warning
     # Problem: Need a combined signal for high load + high volatility.
     # Why this structure: Uses Trend (diff_1) and Context (rel_to_mean) to detect emerging peaks.
     util_rel = new_features[f'robot_utilization_rel_to_mean_5']
     util_rel_clean = util_rel[~np.isnan(util_rel)]
-    util_p90 = np.quantile(util_rel_clean, 0.90) if len(util_rel_clean) > 0 else 1.2
-    
+    # [TASK 11] Use train-derived quantile for util_p90 if available
+    if extreme_quantiles is not None and 'util_rel_p90' in extreme_quantiles:
+        util_p90 = extreme_quantiles['util_rel_p90']
+    else:
+        util_p90 = np.quantile(util_rel_clean, 0.90) if len(util_rel_clean) > 0 else 1.2
+
     inflow_diff = df[f'order_inflow_15m_diff_1']
     new_features['early_warning_flag'] = ((inflow_diff > 0) & (util_rel > util_p90)).astype(int)
     new_features['early_warning_score'] = new_features[f'order_inflow_15m_rel_to_mean_5'] + util_rel
 
-    # Interactions
-    # [WHY_THIS_DESIGN] Manual Interaction Justification
-    # Problem: Linear models miss the multiplicative effect of load and complexity.
-    # Why these 3: Represent core bottleneck intersections (Inflow x Util, Weight x Inflow).
-    new_features['inter_order_inflow_15m_x_robot_utilization'] = df['order_inflow_15m'] * df['robot_utilization']
-    new_features['inter_heavy_item_ratio_x_order_inflow_15m'] = df['heavy_item_ratio'] * df['order_inflow_15m']
-    new_features['inter_heavy_item_ratio_x_robot_utilization'] = df['heavy_item_ratio'] * df['robot_utilization']
-
-    # [PART 4: EXTREME VALUE SEMANTIC RESTORATION]
-    # Detect extreme threshold: use 95th percentile of order_inflow_15m
-    threshold = df['order_inflow_15m'].quantile(0.95)
-    df['is_extreme'] = (df['order_inflow_15m'] >= threshold).astype(np.int8)
-    
-    # [MISSION: FINAL EDGE BOOST] Multi-feature extreme detection
+    # [TASK 11 — EXTREME VALUE QUANTILE CONSISTENCY]
+    # [WHY_THIS_DESIGN] Extreme thresholds MUST originate from train.
+    # [CODE_EVIDENCE] Previously: threshold = df['order_inflow_15m'].quantile(0.95)
+    #   When df is test data, this computes test-derived quantiles — DATA LEAKAGE.
+    # [FAILURE_MODE_PREVENTED] Train/test threshold inconsistency in extreme detection.
     key_extreme_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'near_collision_15m']
+
+    if extreme_quantiles is not None:
+        # TEST MODE: use train-derived quantiles
+        threshold = extreme_quantiles.get('order_inflow_15m', df['order_inflow_15m'].quantile(0.95))
+    else:
+        # TRAIN MODE: compute from train (safe — df IS train)
+        threshold = df['order_inflow_15m'].quantile(0.95)
+
+    df['is_extreme'] = (df['order_inflow_15m'] >= threshold).astype(np.int8)
+
     extreme_masks = []
     for c in key_extreme_cols:
         if c in df.columns:
-            q95 = df[c].quantile(0.95)
+            if extreme_quantiles is not None:
+                q95 = extreme_quantiles.get(c, df[c].quantile(0.95))
+            else:
+                q95 = df[c].quantile(0.95)
             extreme_masks.append(df[c] >= q95)
-    
+
     if extreme_masks:
         df['is_extreme_multi'] = np.logical_or.reduce(extreme_masks).astype(np.int8)
     else:
         df['is_extreme_multi'] = df['is_extreme']
-        
+
     coverage = df['is_extreme_multi'].mean()
     logger.info(f"[EXTREME_INTELLIGENCE] Threshold (P95): {threshold:.4f} | Coverage: {coverage:.2%}")
 
@@ -1144,7 +1322,7 @@ def add_extreme_detection_features(df):
     if overlap:
         logger.info(f"[EXTREME_FEATURES] Dropping {len(overlap)} overlapping columns from ext_df")
         ext_df = ext_df.drop(columns=overlap)
-        
+
     return pd.concat([df, ext_df], axis=1)
 
 def load_data():

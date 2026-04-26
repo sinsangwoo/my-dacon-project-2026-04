@@ -47,9 +47,8 @@ class Trainer:
         # Feature stability will be determined per fold.
         all_features = FEATURE_SCHEMA['all_features']
         
-        # [MISSION: FINAL EDGE BOOST] Integrity Audit
+        # [MISSION: FINAL EDGE BOOST] Integrity Audit (train only — no test reference)
         run_integrity_audit(self.df_train, label="TRAIN_POOL")
-        run_integrity_audit(self.df_test, label="TEST_POOL")
         
         # [WHY_THIS_CHANGE] Fold Consistency Reconstruction (TASK 5)
         # Problem: Feature selection was performed PER FOLD based on local importance.
@@ -63,8 +62,11 @@ class Trainer:
         
         # 1. Global Scaling & Initialization
         global_scaler = DriftShieldScaler()
-        # Use a large sample for global selection to avoid leakage and save memory
-        sample_idx = np.random.choice(n_train, min(n_train, 20000), replace=False)
+        # [TASK 12 — FOLD STABILITY] Use local RNG for deterministic sampling
+        # [CODE_EVIDENCE] Previously: np.random.choice() used global RNG state
+        # [FAILURE_MODE_PREVENTED] Non-deterministic feature selection across runs
+        rng = np.random.RandomState(Config.SEED)
+        sample_idx = rng.choice(n_train, min(n_train, 20000), replace=False)
         sample_df = self.df_train.iloc[sample_idx]
         sample_y = self.y[sample_idx]
         
@@ -82,13 +84,23 @@ class Trainer:
         
         global_reconstructor.fit(sample_df_scaled[Config.PCA_INPUT_COLS].values)
         
-        # 2. Candidate Selection (Stable Raw + Latent)
-        # For simplicity in this global phase, we'll use a fixed stability threshold
-        # to identify initial candidates.
+        # 2. Candidate Selection (Train-Only Stability)
+        # [TASK 4 — FEATURE SELECTION LEAKAGE FIX]
+        # [WHY_THIS_DESIGN] Drift calculation MUST NOT reference test data.
+        # [CODE_EVIDENCE] Previously: audit.calculate_drift(sample_df, self.df_test.head(5000), raw_cols)
+        #   This directly used self.df_test for drift calculation — DATA LEAKAGE.
+        #   Test data was influencing which features were selected for training.
+        # [SOLUTION] Use train-internal holdout split for stability estimation.
+        #   Split the training sample 80/20 and measure drift between the two halves.
+        #   This detects features with high INTERNAL instability (which are also likely
+        #   to be unstable vs test) without ever seeing test data.
+        # [FAILURE_MODE_PREVENTED] Test data referenced before final inference.
         from .distribution import DomainShiftAudit, FeatureStabilityFilter
         audit = DomainShiftAudit()
-        # Compare sample to test set for global stability
-        drift_df = audit.calculate_drift(sample_df, self.df_test.head(5000), raw_cols)
+        n_sample_split = int(len(sample_df) * 0.8)
+        sample_train_half = sample_df.iloc[:n_sample_split]
+        sample_holdout_half = sample_df.iloc[n_sample_split:]
+        drift_df = audit.calculate_drift(sample_train_half, sample_holdout_half, raw_cols)
         stability_filter = FeatureStabilityFilter(threshold=Config.STABILITY_THRESHOLD)
         stability_filter.fit(drift_df)
         
@@ -110,17 +122,27 @@ class Trainer:
         imp_df = pd.DataFrame({'f': initial_candidates, 'i': imp}).sort_values('i', ascending=False)
         imp_df['c'] = imp_df['i'].cumsum() / (imp_df['i'].sum() + 1e-9)
         
-        # Derive global cutoff
-        cum_series_vals = imp_df['c'].values
-        n_feats = len(cum_series_vals)
-        p80_idx = int(np.ceil(0.80 * n_feats)) - 1
-        p80_val = float(cum_series_vals[min(p80_idx, n_feats - 1)])
-        IMPORTANCE_CUTOFF = float(np.clip(p80_val, 0.80, 0.97))
+        # [TASK 6 — IMPORTANCE_CUTOFF LOGIC FIX]
+        # [WHY_THIS_DESIGN] Use direct cumulative importance threshold, not positional percentile.
+        # [CODE_EVIDENCE] Previously:
+        #   p80_idx = int(np.ceil(0.80 * n_feats)) - 1
+        #   p80_val = float(cum_series_vals[min(p80_idx, n_feats - 1)])
+        #   IMPORTANCE_CUTOFF = float(np.clip(p80_val, 0.80, 0.97))
+        # This computed the cumulative importance VALUE at the 80th PERCENTILE POSITION,
+        # then clipped it. This conflates feature count with importance coverage.
+        # Example failure: If top 10% of features cover 99% importance, p80_idx points
+        # to a feature with ~100% cumulative importance, and the cutoff becomes 0.97 (clipped).
+        # This would KEEP features with near-zero marginal importance.
+        # [MATHEMATICAL FIX] Directly set cumulative importance target = 0.95.
+        # Keep features until their cumulative importance reaches 95% of total.
+        # This is the correct interpretation: "features covering 95% of model signal."
+        # [FAILURE_MODE_PREVENTED] Over-inclusion of zero-importance features.
+        IMPORTANCE_CUTOFF = 0.95
         
         selected_features = imp_df[imp_df['c'] <= IMPORTANCE_CUTOFF]['f'].tolist()
         if not selected_features: selected_features = initial_candidates[:100]
         
-        logger.info(f"[GLOBAL_SELECTION] Selected {len(selected_features)} features for all folds (Cutoff {IMPORTANCE_CUTOFF}).")
+        logger.info(f"[GLOBAL_SELECTION] Selected {len(selected_features)} features for all folds (Cumulative importance cutoff={IMPORTANCE_CUTOFF}).")
         
         # Cleanup global phase
         del sample_df, sample_df_drifted, sample_df_scaled, sample_df_full, X_sample, temp_model, imp_df

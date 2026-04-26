@@ -224,7 +224,7 @@ class PruningManifest:
 
     Fields:
         nan_threshold   : Derived NaN drop threshold (computed on train NaN distribution).
-        corr_threshold  : Derived correlation pruning threshold (IQR-based, computed on train).
+        corr_threshold  : Derived correlation pruning threshold (cluster-based, computed on train).
         var_threshold   : Derived variance floor threshold (P5 of train variance distribution).
         cols_to_drop_nan: Feature names dropped due to high NaN on train.
         cols_to_drop_corr: Feature names dropped due to high correlation on train.
@@ -240,6 +240,15 @@ class PruningManifest:
     cols_to_drop_var: List[str]
     derivation_log: Dict[str, str] = field(default_factory=dict)
     regime_boundaries: Dict[str, float] = field(default_factory=dict)
+    # [TASK 5 — CAUSAL FALLBACK LEAKAGE FIX]
+    # Stores per-column means computed on TRAIN data only.
+    # Used as fallback in add_time_series_features() instead of df[col].mean()
+    # which would leak test distribution when processing test data.
+    train_col_means: Dict[str, float] = field(default_factory=dict)
+    # [TASK 11 — EXTREME QUANTILE CONSISTENCY]
+    # Stores P95 quantiles computed on TRAIN data only.
+    # Used in add_extreme_detection_features() to ensure test uses train thresholds.
+    extreme_quantiles: Dict[str, float] = field(default_factory=dict)
 
     def all_dropped(self) -> List[str]:
         """Return flat list of all features to drop (union of all reasons)."""
@@ -266,7 +275,9 @@ class PruningManifest:
             cols_to_drop_corr=data["cols_to_drop_corr"],
             cols_to_drop_var=data["cols_to_drop_var"],
             derivation_log=data.get("derivation_log", {}),
-            regime_boundaries=data.get("regime_boundaries", {})
+            regime_boundaries=data.get("regime_boundaries", {}),
+            train_col_means=data.get("train_col_means", {}),
+            extreme_quantiles=data.get("extreme_quantiles", {})
         )
         logger.info(
             f"[PRUNING_MANIFEST] Loaded from {path} | "

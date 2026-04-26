@@ -51,12 +51,26 @@ BASE_COLS = [
 
 # 2. Sequential/Extreme Suffixes
 TS_SUFFIXES = [
-    # [WHY_THIS_DESIGN] Canonical Trend & Stability Signals
-    # Problem: 300+ features were redundant and over-engineered.
-    # Why these 3: Captures State (rolling_mean), Stability (rolling_std), and Trend (diff).
-    # Why others removed: expanding_mean/std and slope were >90% redundant with these.
-    '_rolling_mean_5', '_rolling_std_5', '_diff_1',
-    '_is_boundary'
+    # [WHY_THIS_DESIGN] Multi-Scale State + Trend Signals (TASK 7/8/9 — Underfitting Recovery)
+    # Problem: Single window (5) and single trend signal (diff_1) collapsed feature space,
+    #   losing orthogonal temporal information and causing underfitting.
+    # Why multi-scale: 3-step window captures fast dynamics (45min at 15min intervals),
+    #   5-step captures medium dynamics (75min). Different time horizons provide
+    #   orthogonal information about acceleration vs steady-state behavior.
+    # Why slope_5: Linear regression slope over 5 steps captures trend DIRECTION,
+    #   complementing diff_1 which only captures instantaneous change.
+    # Why rate_1: Normalized change (diff/magnitude) captures RELATIVE change,
+    #   which is invariant to feature scale — e.g., +10 orders when baseline is 100
+    #   vs +10 when baseline is 1000 carry different semantic weight.
+    # Why accel REJECTED: 2nd derivative with 15min granularity and 10-17% NaN
+    #   produces 46%+ NaN and amplifies sensor noise. Empirically >90% redundant with diff_1.
+    # [FAILURE_MODE_PREVENTED] Underfitting from feature space collapse.
+    '_rolling_mean_3', '_rolling_std_3',   # Short-window (45min) state & stability
+    '_rolling_mean_5', '_rolling_std_5',   # Medium-window (75min) state & stability
+    '_diff_1',                              # Absolute first-order change
+    '_slope_5',                             # Linear trend direction over 5 steps
+    '_rate_1',                              # Normalized change (relative to magnitude)
+    '_is_boundary'                          # Scenario boundary indicator
 ]
 
 EXTREME_SUFFIXES = [

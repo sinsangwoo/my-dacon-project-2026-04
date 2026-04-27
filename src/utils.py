@@ -600,8 +600,16 @@ class DriftShieldScaler:
             
             if len(series) == 0: continue
             
-            p1 = float(np.quantile(series, 0.01))
-            p99 = float(np.quantile(series, 0.99))
+            # [AUDIT_FIX] Sensitive feature variance preservation
+            # [EVIDENCE] Forensic report proved that P1/P99 clipping destroyed 60-85% of variance
+            #   in _rate_1 and _diff_1 features, causing severe model underfitting.
+            is_sensitive = any(s in col for s in ('_rate_1', '_diff_1', '_slope_5'))
+            if is_sensitive:
+                p1 = float(np.quantile(series, 0.001))
+                p99 = float(np.quantile(series, 0.999))
+            else:
+                p1 = float(np.quantile(series, 0.01))
+                p99 = float(np.quantile(series, 0.99))
             
             # [STRATEGY 4 — VARIANCE-AWARE FEATURE FILTERING]
             # [WHY_THIS_CHANGE] Compute clipped_std at fit time as the proper baseline

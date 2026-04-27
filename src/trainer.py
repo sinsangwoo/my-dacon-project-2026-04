@@ -6,7 +6,7 @@ import gc
 import json
 import pickle
 from lightgbm import LGBMRegressor
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, GroupKFold
 from sklearn.metrics import mean_absolute_error
 from .config import Config
 from .schema import FEATURE_SCHEMA, BASE_COLS
@@ -24,7 +24,7 @@ class Trainer:
         self.y = y
         self.df_test = test_df if test_df is not None else df_test
         self.groups = groups
-        self.kf = KFold(n_splits=Config.NFOLDS, shuffle=True, random_state=Config.SEED)
+        self.kf = GroupKFold(n_splits=Config.NFOLDS)
         self.models = []
         self.oof = np.zeros(len(self.y))
         self.test_preds = {}
@@ -75,7 +75,7 @@ class Trainer:
         logger.info("[TRAINER] Starting leakage-free training loop...")
         
         # 1. Global Pre-sampling for Feature Selection (20k rows max for speed)
-        sample_size = min(20000, len(self.df_train))
+        sample_size = min(100000, len(self.df_train))
         sample_indices = np.random.choice(len(self.df_train), sample_size, replace=False)
         sample_df = self.df_train.iloc[sample_indices]
         sample_y = self.y[sample_indices]
@@ -100,33 +100,38 @@ class Trainer:
         
         global_reconstructor.fit(sample_df_scaled[Config.PCA_INPUT_COLS].values)
         
-        # 2. Candidate Selection (Train-Only Stability)
-        from .distribution import DomainShiftAudit, FeatureStabilityFilter
+        # [AUDIT_FIX] Task 3.1: Train vs Test Drift Pruning
+        # [WHY] Features that differ significantly between Train and Test cause high ADV AUC.
+        # [EVIDENCE] KS=1.0 detected on layout_mean features in run_20260427_155732.
+        from .distribution import DomainShiftAudit
         audit = DomainShiftAudit()
-        n_sample_split = int(len(sample_df) * 0.8)
-        sample_train_half = sample_df.iloc[:n_sample_split]
-        sample_holdout_half = sample_df.iloc[n_sample_split:]
-        
-        # [TASK 1] Compute drift on ALL features available before latent generation
         audit_cols = [c for c in sample_df.columns if c not in Config.ID_COLS and c != Config.TARGET]
-        drift_df = audit.calculate_drift(sample_train_half, sample_holdout_half, audit_cols)
-        stability_filter = FeatureStabilityFilter(threshold=Config.STABILITY_THRESHOLD)
-        stability_filter.fit(drift_df)
+        drift_df = audit.calculate_drift(self.df_train, self.df_test, audit_cols)
         
-        # [TASK 3] Accept all candidates; Stability Filter is now a Soft Gate.
-        from .distribution import VarianceMonitor
+        # Hard Pruning: drop features with KS > ADV_PRUNING_THRESHOLD
+        # [REFINED] Spare BASE_COLS — they are essential and will be handled by Adversarial Weighting.
+        from .schema import BASE_COLS
+        adv_pruned_cols = drift_df[
+            (drift_df['ks_stat'] > Config.ADV_PRUNING_THRESHOLD) & 
+            (~drift_df['feature'].isin(BASE_COLS))
+        ]['feature'].tolist()
+        logger.warning(f"[ADV_PRUNE] Dropping {len(adv_pruned_cols)} features with KS > {Config.ADV_PRUNING_THRESHOLD} (BASE_COLS spared)")
         
-        # [TASK 1] Decoupled Diagnostic Audit
-        var_monitor = VarianceMonitor()
-        var_stats = var_monitor.audit_variance(sample_df_drifted, global_scaler.stats, raw_cols)
-        
-        # initial_candidates now explicitly includes unstable_candidates
-        # Let the downstream SignalValidator determine their final fate.
+        # Update candidates list (excluding pruned features)
         initial_candidates = [
             f for f in all_features 
-            if (f in stability_filter.stable_features or f in stability_filter.unstable_candidates or any(p in f for p in ['embed', 'weighted', 'trend', 'volatility', 'regime', 'local_density', 'similarity', 'inter_']))
-            and (f not in FEATURE_SCHEMA['raw_features'] or f in raw_cols)
+            if f not in adv_pruned_cols and (any(p in f for p in ['embed', 'weighted', 'trend', 'volatility', 'regime', 'local_density', 'similarity', 'inter_']) or f in raw_cols)
         ]
+        
+        # [TASK 3.2] Compute Adversarial Weights
+        adv_weights = None
+        if Config.USE_ADVERSARIAL_WEIGHTING:
+            adv_weights = self.compute_adversarial_weights(initial_candidates)
+            
+        # [TASK 1] Decoupled Diagnostic Audit
+        from .distribution import VarianceMonitor
+        var_monitor = VarianceMonitor()
+        var_stats = var_monitor.audit_variance(sample_df_drifted, global_scaler.stats, raw_cols)
         
         # 3. Global Importance Pruning
         global_reconstructor.build_fold_cache(sample_df_scaled)
@@ -352,41 +357,23 @@ class Trainer:
             val_df_full = apply_latent_features(val_df_scaled, reconstructor, scaler=None, selected_features=fold_features, is_train=False)
             X_val_fold = val_df_full[fold_features].values.astype(np.float32)
             
-            # [ENSEMBLE_STAGE_1] Base Model focuses on overall MAE without target distortion
-            weights = np.ones(len(y_tr))
+            # Apply Adversarial Weights if enabled
+            sample_weight = None
+            if adv_weights is not None:
+                sample_weight = adv_weights[tr_idx]
             
-            # Final Fold Model (Base - Mean Prediction)
-            # [ENSEMBLE_STAGE_1] Base Model focuses on overall MAE
-            base_model = LGBMRegressor(**Config.RAW_LGBM_PARAMS)
-            SAFE_FIT(base_model, X_tr_fold, y_tr, sample_weight=weights,
+            # [AUDIT_FIX] Single Base Model — Tail ensemble removed.
+            # [EVIDENCE] Forensic validation proved tail model ALWAYS increases MAE.
+            #   Damping sweep 0.0→1.0: MAE monotonically worsened from 2.75 to 3.23.
+            #   Oracle selective application also failed to beat Base Only.
+            model = LGBMRegressor(**Config.RAW_LGBM_PARAMS)
+            SAFE_FIT(model, X_tr_fold, y_tr, sample_weight=sample_weight,
                       eval_set=[(X_val_fold, y_val)], 
                       eval_metric='mae')
-                      
-            # Final Fold Model (Tail - Quantile Prediction)
-            # [ENSEMBLE_STAGE_2] Tail Specialist focuses strictly on P95+ boundary
-            tail_model = LGBMRegressor(**Config.QUANTILE_LGBM_PARAMS)
-            SAFE_FIT(tail_model, X_tr_fold, y_tr, sample_weight=weights,
-                      eval_set=[(X_val_fold, y_val)], 
-                      eval_metric='mae') # metric is MAE just for logging/early stopping compat
             
-            # [ENSEMBLE_MERGE] Smooth Trust-Factor Blending
-            # The Quantile model (alpha=0.95) overpredicts by design. We only trust it
-            # when the Base model already suspects a high value (top 10%).
-            oof_base = SAFE_PREDICT(base_model, X_val_fold)
-            oof_tail = SAFE_PREDICT(tail_model, X_val_fold)
-            
-            p80 = np.percentile(oof_base, 80)
-            p95 = np.percentile(oof_base, 95)
-            
-            # 0.0 below P80, 1.0 above P95, linear in between
-            trust_factor = np.clip((oof_base - p80) / (p95 - p80 + 1e-9), 0.0, 1.0)
-            
-            # Apply Damping Factor (0.5) to satisfy ADV AUC <= 0.75
-            DAMPING = 0.5
-            self.oof[val_idx] = oof_base * (1.0 - trust_factor) + (oof_base + (oof_tail - oof_base) * DAMPING) * trust_factor
-            
+            self.oof[val_idx] = SAFE_PREDICT(model, X_val_fold)
             fold_mae = mean_absolute_error(y_val, self.oof[val_idx])
-            logger.info(f"[FOLD {fold}] Base MAE: {mean_absolute_error(y_val, oof_base):.4f} | Ensembled MAE: {fold_mae:.4f}")
+            logger.info(f"[FOLD {fold}] MAE: {fold_mae:.4f}")
             self.fold_stats.append({'fold': fold, 'mae': fold_mae, 'n_features': len(fold_features)})
             
             # [PHASE 5: PERSISTENCE] Save all fold-specific artifacts for Phase 7 Inference
@@ -402,9 +389,7 @@ class Trainer:
             with open(f'{Config.MODELS_PATH}/reconstructors/norm_scaler_fold_{fold}.pkl', 'wb') as f:
                 pickle.dump(norm_scaler, f)
             with open(f'{Config.MODELS_PATH}/lgbm/model_fold_{fold}.pkl', 'wb') as f:
-                pickle.dump(base_model, f)
-            with open(f'{Config.MODELS_PATH}/lgbm/tail_model_fold_{fold}.pkl', 'wb') as f:
-                pickle.dump(tail_model, f)
+                pickle.dump(model, f)
             
             # Inference on Test
             test_df_drifted = scaler.transform(test_df_fold, raw_cols)
@@ -416,21 +401,9 @@ class Trainer:
             if 'final' not in self.test_preds:
                 self.test_preds['final'] = np.zeros(len(test_df_fold))
             
-            # [RESTORED] Direct prediction accumulation (no inverse transform)
-            # [ROLLBACK] expm1 removed — target is now in real minutes, no transform needed.
-            test_base = SAFE_PREDICT(base_model, X_te)
-            test_tail = SAFE_PREDICT(tail_model, X_te)
+            self.test_preds['final'] += SAFE_PREDICT(model, X_te) / Config.NFOLDS
             
-            # Apply identical Trust Factor to inference
-            # We use OOF percentiles, NOT test percentiles, to anchor the distribution.
-            tf_test = np.clip((test_base - p80) / (p95 - p80 + 1e-9), 0.0, 1.0)
-            
-            DAMPING_TEST = 0.5
-            test_ensembled = test_base * (1.0 - tf_test) + (test_base + (test_tail - test_base) * DAMPING_TEST) * tf_test
-            
-            self.test_preds['final'] += test_ensembled / Config.NFOLDS
-            
-            self.models.append((base_model, tail_model))
+            self.models.append(model)
             del tr_df_scaled_all, val_df_full, test_df_full, X_tr_fold, X_val_fold, X_te
             gc.collect()
 
@@ -469,3 +442,45 @@ class Trainer:
         if ratio < 0.1 or ratio > 2.0:
             logger.error(f"!!! [CRITICAL_DIST_VIOLATION] Std Ratio {ratio:.4f} outside safe bounds [0.1, 2.0] !!!")
             # In a real scenario we might raise an error here, but for now we just log heavily.
+
+    def compute_adversarial_weights(self, features):
+        """
+        [PHASE 3: ADVERSARIAL WEIGHTING]
+        Computes sample weights for training based on similarity to test set distribution.
+        Formula: w = P(is_test) / P(is_train) = P / (1 - P)
+        """
+        logger.info(f"[ADV_WEIGHT] Computing weights using {len(features)} features...")
+        
+        # 1. Prepare data for Adversarial Classifier
+        # Use a subset of features that actually exist in raw data
+        raw_feat = [f for f in features if f in self.df_train.columns and f in self.df_test.columns]
+        
+        X_tr = self.df_train[raw_feat].copy().fillna(-999).values.astype(np.float32)
+        X_te = self.df_test[raw_feat].copy().fillna(-999).values.astype(np.float32)
+        
+        X = np.vstack([X_tr, X_te])
+        y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))])
+        
+        # 2. Train a fast classifier
+        from lightgbm import LGBMClassifier
+        adv_clf = LGBMClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42, verbose=-1)
+        adv_clf.fit(X, y)
+        
+        # 3. Predict probability of being "Test" for Train samples
+        probs = adv_clf.predict_proba(X_tr)[:, 1]
+        
+        # 4. Compute weights: w = p / (1 - p)
+        # Handle division by zero/extreme probabilities
+        probs = np.clip(probs, 0.01, 0.99)
+        weights = probs / (1.0 - probs)
+        
+        # 5. Normalize weights to have mean 1.0 to preserve learning rate scale
+        weights = weights / np.mean(weights)
+        
+        # 6. Clip extreme weights to avoid noisy samples dominating
+        w_p10 = np.percentile(weights, 10)
+        w_p90 = np.percentile(weights, 90)
+        weights = np.clip(weights, w_p10, w_p90)
+        
+        logger.info(f"[ADV_WEIGHT] Weights computed. Range: [{weights.min():.4f}, {weights.max():.4f}] | Mean: {weights.mean():.4f}")
+        return weights

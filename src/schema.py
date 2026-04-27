@@ -113,6 +113,12 @@ def get_feature_schema():
         
     raw_features.extend(["early_warning_flag", "early_warning_score", "is_extreme", "is_extreme_multi"])
     
+    # [LAYOUT_AGGREGATION] Task 2.3
+    layout_target_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'avg_trip_distance', 'pack_utilization']
+    for col in layout_target_cols:
+        raw_features.append(f"{col}_layout_mean")
+        raw_features.append(f"{col}_layout_std")
+    
     # [EMBED]
     embed_features = []
     # Graph-based latent aggregations

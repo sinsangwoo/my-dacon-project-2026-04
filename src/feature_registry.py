@@ -248,6 +248,8 @@ class PruningManifest:
     # Stores P95 quantiles computed on TRAIN data only.
     # Used in add_extreme_detection_features() to ensure test uses train thresholds.
     extreme_quantiles: Dict[str, float] = field(default_factory=dict)
+    # [LAYOUT_AGGREGATION] Store train-derived layout statistics for zero-leakage test processing
+    layout_stats: Dict[str, Dict[str, float]] = field(default_factory=dict)
 
     def all_dropped(self) -> List[str]:
         """Return flat list of all features to drop (union of all reasons)."""
@@ -274,7 +276,8 @@ class PruningManifest:
             derivation_log=data.get("derivation_log", {}),
             regime_boundaries=data.get("regime_boundaries", {}),
             train_col_means=data.get("train_col_means", {}),
-            extreme_quantiles=data.get("extreme_quantiles", {})
+            extreme_quantiles=data.get("extreme_quantiles", {}),
+            layout_stats=data.get("layout_stats", {})
         )
         logger.info(
             f"[PRUNING_MANIFEST] Loaded from {path} | "

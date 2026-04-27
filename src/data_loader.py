@@ -159,10 +159,10 @@ class SuperchargedPCAReconstructor:
     """Supervised, Multi-View PCA Reconstructor."""
     def __init__(self, input_dim):
         self.input_dim = input_dim
-        self.pca_raw = PCA(n_components=8, svd_solver='randomized', random_state=42)
-        self.pca_log = PCA(n_components=8, svd_solver='randomized', random_state=42)
-        self.pca_rank = PCA(n_components=8, svd_solver='randomized', random_state=42)
-        self.global_pca_local = PCA(n_components=8, svd_solver='randomized', random_state=42)
+        self.pca_raw = PCA(n_components=10, svd_solver='randomized', random_state=42)
+        self.pca_log = PCA(n_components=10, svd_solver='randomized', random_state=42)
+        self.pca_rank = PCA(n_components=10, svd_solver='randomized', random_state=42)
+        self.global_pca_local = PCA(n_components=10, svd_solver='randomized', random_state=42)
         self.kmeans = KMeans(n_clusters=10, random_state=42, n_init='auto')
         # self.scaler = StandardScaler() # [PHASE 2: REMOVE DUPLICATED SCALING]
         self.imputer = SimpleImputer(strategy='median')
@@ -245,11 +245,11 @@ class SuperchargedPCAReconstructor:
             try:
                 pca.fit(X_view)
                 var_sum = np.sum(pca.explained_variance_ratio_)
-                if var_sum < 0.8:
-                    logger.warning(f"[PCA_LOW_VARIANCE] {tag} explained variance: {var_sum:.4f} < 0.8. Switching to Mode B for this view.")
+                if var_sum < 0.70:
+                    logger.warning(f"[PCA_LOW_VARIANCE] {tag} explained variance: {var_sum:.4f} < 0.70. Switching to Mode B for this view.")
                     self.active_pcas[tag] = False # Fallback to raw for this view
                 else:
-                    logger.info(f"[PCA_QC_SUCCESS] {tag} PCA explained variance: {var_sum:.4f} >= 0.8")
+                    logger.info(f"[PCA_QC_SUCCESS] {tag} PCA explained variance: {var_sum:.4f} >= 0.70")
                     self.active_pcas[tag] = True
             except Exception as e:
                 logger.error(f"[PCA_FIT_FAILURE] {tag} failed: {str(e)}. Switching to Mode B for this view.")
@@ -612,6 +612,35 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
 
     logger.info(f"[BUILD_BASE] After Extreme Expansion: {len(df.columns)}")
     
+    # [LAYOUT_AGGREGATION] Task 2.3: Add Layout-level context features
+    # Window-level and scenario-level features miss the physical context of the warehouse.
+    layout_target_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'avg_trip_distance', 'pack_utilization']
+    if is_train_mode:
+        layout_stats = {}
+        if 'layout_id' in df.columns:
+            for col in layout_target_cols:
+                if col in df.columns:
+                    # Compute mean and std per layout_id on train
+                    grp = df.groupby('layout_id')[col]
+                    mean_dict = grp.mean().to_dict()
+                    std_dict = grp.std().to_dict()
+                    
+                    df[f"{col}_layout_mean"] = df['layout_id'].map(mean_dict).fillna(0.0)
+                    df[f"{col}_layout_std"] = df['layout_id'].map(std_dict).fillna(0.0)
+                    
+                    layout_stats[f"{col}_layout_mean"] = mean_dict
+                    layout_stats[f"{col}_layout_std"] = std_dict
+    else:
+        layout_stats = pruning_manifest.layout_stats
+        if 'layout_id' in df.columns:
+            for col in layout_target_cols:
+                if f"{col}_layout_mean" in layout_stats:
+                    df[f"{col}_layout_mean"] = df['layout_id'].map(layout_stats[f"{col}_layout_mean"]).fillna(0.0)
+                if f"{col}_layout_std" in layout_stats:
+                    df[f"{col}_layout_std"] = df['layout_id'].map(layout_stats[f"{col}_layout_std"]).fillna(0.0)
+                    
+    logger.info(f"[BUILD_BASE] After Layout Aggregation: {len(df.columns)}")
+
     # 3. Order Restoration
     df = df.set_index('ID').loc[original_ids].reset_index()
     
@@ -1035,7 +1064,8 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
             # [TASK 5] Train-derived column means for causal fallback
             train_col_means=train_col_means,
             # [TASK 11] Train-derived extreme quantiles for consistent detection
-            extreme_quantiles=extreme_quantiles
+            extreme_quantiles=extreme_quantiles,
+            layout_stats=layout_stats
         )
         return df, manifest, registry
     else:

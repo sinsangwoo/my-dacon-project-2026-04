@@ -99,13 +99,14 @@ class Config:
     RAW_LGBM_PARAMS = LGBM_PARAMS.copy()
     EMBED_LGBM_PARAMS = LGBM_PARAMS.copy()
     
-    # [STRUCTURAL_FIX] Quantile Tail Specialist (Task 1)
-    QUANTILE_LGBM_PARAMS = LGBM_PARAMS.copy()
-    QUANTILE_LGBM_PARAMS['objective'] = 'quantile'
-    QUANTILE_LGBM_PARAMS['alpha'] = 0.95
+
 
     
-    # [EMBEDDING_CONTRACT]
+    # [ADVERSARIAL_CONTRACT]
+    ADV_PRUNING_THRESHOLD = 0.15 # KS statistic threshold
+    USE_ADVERSARIAL_WEIGHTING = True
+    
+    # [GENERAL_CONTRACT]
     from .schema import BASE_COLS, EMBED_DIM, MULTI_K
     
     # [STRUCTURAL_REALIGNMENT]

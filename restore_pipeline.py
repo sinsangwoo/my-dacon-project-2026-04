@@ -1,22 +1,21 @@
+"""v16.0 Pipeline Restoration Tool.
+
+Restores a broken run by executing all phases sequentially.
+"""
 import subprocess
 import sys
+import os
 
-phases = [
-    "1_data_check",
-    "2_build_raw",
-    "3_train_raw",
-    "4_build_full",
-    "5_train_final",
-    "6_retrain",
-    "7_inference",
-    "8_submission",
-    "9_intelligence"
-]
+# Import phases from main to ensure SSOT
+sys.path.append(os.getcwd())
+from main import VALID_PHASES
 
-def run_phase(phase):
+def run_phase(phase, run_id=None):
     cmd = [sys.executable, "main.py", "--phase", phase, "--mode", "full"]
+    if run_id:
+        cmd += ["--run-id", run_id]
+        
     print(f"\n--- Running Phase: {phase} ---")
-    # Don't capture output so we can see it in real-time
     result = subprocess.run(cmd)
     
     if result.returncode != 0:
@@ -25,10 +24,18 @@ def run_phase(phase):
     return True
 
 def main():
-    for phase in phases:
-        if not run_phase(phase):
+    import argparse
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--run-id", type=str, help="Existing RUN_ID to continue")
+    args = parser.parse_args()
+    
+    print(f"Starting Pipeline Restoration | RUN_ID: {args.run_id or 'NEW'}")
+    
+    for phase in VALID_PHASES:
+        if not run_phase(phase, args.run_id):
             print(f"Pipeline stopped at phase: {phase}")
             sys.exit(1)
+            
     print("\n--- Pipeline Restoration SUCCESS! ---")
 
 if __name__ == "__main__":

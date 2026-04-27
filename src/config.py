@@ -39,16 +39,16 @@ This system now enforces:
 class Config:
     # --- Existing Path Contracts ---
     RUN_ID = os.getenv('RUN_ID', datetime.now().strftime("run_%Y%m%d_%H%M%S"))
-    DATA_PATH = "./data/"
-    OUTPUT_BASE = f"./outputs/{RUN_ID}/"
-    PROCESSED_PATH = f"{OUTPUT_BASE}processed/"
-    MODELS_PATH = f"{OUTPUT_BASE}models/"
-    SUBMISSION_PATH = f"{OUTPUT_BASE}submission.csv"
-    PREDICTIONS_PATH = f"{OUTPUT_BASE}predictions/"
-    LOG_DIR = f"{OUTPUT_BASE}logs/"
-    SUMMARY_DIR = f"{OUTPUT_BASE}summary/"
+    DATA_PATH = "./data"
+    OUTPUT_BASE = f"./outputs/{RUN_ID}"
+    PROCESSED_PATH = f"{OUTPUT_BASE}/processed"
+    MODELS_PATH = f"{OUTPUT_BASE}/models"
+    SUBMISSION_PATH = f"{OUTPUT_BASE}/submission.csv"
+    PREDICTIONS_PATH = f"{OUTPUT_BASE}/predictions"
+    LOG_DIR = f"{OUTPUT_BASE}/logs"
+    SUMMARY_DIR = f"{OUTPUT_BASE}/summary"
     LAYOUT_PATH = "./data/layout_info.csv"
-    GLOBAL_STATS_PATH = f"{PROCESSED_PATH}global_stats.json"
+    GLOBAL_STATS_PATH = f"{PROCESSED_PATH}/global_stats.json"
     
     # --- Operational Parameters ---
     SEED = 42
@@ -99,6 +99,12 @@ class Config:
     RAW_LGBM_PARAMS = LGBM_PARAMS.copy()
     EMBED_LGBM_PARAMS = LGBM_PARAMS.copy()
     
+    # [STRUCTURAL_FIX] Quantile Tail Specialist (Task 1)
+    QUANTILE_LGBM_PARAMS = LGBM_PARAMS.copy()
+    QUANTILE_LGBM_PARAMS['objective'] = 'quantile'
+    QUANTILE_LGBM_PARAMS['alpha'] = 0.95
+
+    
     # [EMBEDDING_CONTRACT]
     from .schema import BASE_COLS, EMBED_DIM, MULTI_K
     
@@ -130,14 +136,14 @@ class Config:
         """Update all paths when RUN_ID changes at runtime."""
         if run_id:
             cls.RUN_ID = run_id
-        cls.OUTPUT_BASE = f"./outputs/{cls.RUN_ID}/"
-        cls.PROCESSED_PATH = f"{cls.OUTPUT_BASE}processed/"
-        cls.MODELS_PATH = f"{cls.OUTPUT_BASE}models/"
-        cls.SUBMISSION_PATH = f"{cls.OUTPUT_BASE}submission.csv"
-        cls.PREDICTIONS_PATH = f"{cls.OUTPUT_BASE}predictions/"
-        cls.LOG_DIR = f"{cls.OUTPUT_BASE}logs/"
-        cls.SUMMARY_DIR = f"{cls.OUTPUT_BASE}summary/"
-        cls.GLOBAL_STATS_PATH = f"{cls.PROCESSED_PATH}global_stats.json"
+        cls.OUTPUT_BASE = f"./outputs/{cls.RUN_ID}"
+        cls.PROCESSED_PATH = f"{cls.OUTPUT_BASE}/processed"
+        cls.MODELS_PATH = f"{cls.OUTPUT_BASE}/models"
+        cls.SUBMISSION_PATH = f"{cls.OUTPUT_BASE}/submission.csv"
+        cls.PREDICTIONS_PATH = f"{cls.OUTPUT_BASE}/predictions"
+        cls.LOG_DIR = f"{cls.OUTPUT_BASE}/logs"
+        cls.SUMMARY_DIR = f"{cls.OUTPUT_BASE}/summary"
+        cls.GLOBAL_STATS_PATH = f"{cls.PROCESSED_PATH}/global_stats.json"
 
     @classmethod
     def setup_directories(cls):

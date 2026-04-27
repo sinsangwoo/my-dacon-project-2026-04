@@ -67,7 +67,7 @@ def run_structural_audit(mode='real_data'):
             df_input = dummy_df
         else:
             # Load a SMALL SAMPLE of real train data
-            full_train = pd.read_csv(f"{Config.DATA_PATH}train.csv", nrows=500)
+            full_train = pd.read_csv(os.path.join(Config.DATA_PATH, "train.csv"), nrows=500)
             layout = pd.read_csv(Config.LAYOUT_PATH)
             full_train = full_train.merge(layout, on="layout_id", how="left")
             # Downcast not strictly necessary for 500 rows, but safe

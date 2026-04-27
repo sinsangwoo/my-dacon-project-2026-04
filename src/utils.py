@@ -23,6 +23,8 @@ class NumpyEncoder(json.JSONEncoder):
             return float(obj)
         if isinstance(obj, np.ndarray):
             return obj.tolist()
+        if isinstance(obj, (np.bool_, bool)):
+            return bool(obj)
         return super(NumpyEncoder, self).default(obj)
 
 def save_json(data, path, indent=2):

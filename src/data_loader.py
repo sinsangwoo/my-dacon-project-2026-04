@@ -542,7 +542,13 @@ def get_protected_candidates(df_columns):
             if col_name.startswith(base_col) and any(col_name.endswith(s) for s in SIGNAL_BUCKET_SUFFIXES):
                 protected.add(col_name)
                 break
-                
+
+        # 3. [STRUCTURAL_FIX v16.5] Interaction features are always forensic candidates
+        # [Task 2] Expanding protection to all interaction variants
+        complex_prefixes = ('inter_', 'ratio_', 'diff_', 'logprod_', 'bucket_')
+        if any(col_name.startswith(p) for p in complex_prefixes):
+            protected.add(col_name)
+
     return protected
 
 def build_base_features(df, pruning_manifest: "PruningManifest" = None):
@@ -1347,13 +1353,25 @@ def add_extreme_detection_features(df, extreme_quantiles=None):
         rm5 = series.rolling(5, min_periods=1).mean().values
         new_features[f"{col}_rel_to_mean_5"] = np.where(np.abs(rm5) > eps, (df[col] - rm5) / (rm5 + eps), 0.0)
 
-    # [WHY_THIS_DESIGN] Manual Interaction Justification
-    # Problem: Linear models miss the multiplicative effect of load and complexity.
-    # Why these 3: Represent core bottleneck intersections (Inflow x Util, Weight x Inflow).
-    # [TASK 2] Single authoritative injection point — no duplicates.
-    new_features['inter_order_inflow_15m_x_robot_utilization'] = df['order_inflow_15m'] * df['robot_utilization']
-    new_features['inter_heavy_item_ratio_x_order_inflow_15m'] = df['heavy_item_ratio'] * df['order_inflow_15m']
-    new_features['inter_heavy_item_ratio_x_robot_utilization'] = df['heavy_item_ratio'] * df['robot_utilization']
+    # [STRUCTURAL_FIX] Expanded Interaction Engine (Task 2)
+    # [WHY] Tree models handle step-functions (Buckets) better than raw products.
+    # [FIX] C(5,2)=10 pairs from high-priority sensors.
+    priority_sensors = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'battery_std', 'heavy_item_ratio']
+    import itertools
+    for c1, c2 in itertools.combinations(priority_sensors, 2):
+        if c1 in df.columns and c2 in df.columns:
+            # 1. Product (Standard)
+            new_features[f'inter_{c1}_x_{c2}'] = df[c1] * df[c2]
+            # 2. Ratio (Efficiency)
+            new_features[f'ratio_{c1}_to_{c2}'] = df[c1] / (df[c2] + 1e-9)
+            # 3. Difference (Relative Delta)
+            new_features[f'diff_{c1}_{c2}'] = df[c1] - df[c2]
+            # 4. Log-Product (Elasticity)
+            new_features[f'logprod_{c1}_{c2}'] = np.log1p(df[c1] * df[c2])
+            # 5. Bucketed Interaction (Step-function)
+            b1 = pd.qcut(df[c1], 5, labels=False, duplicates='drop')
+            b2 = pd.qcut(df[c2], 5, labels=False, duplicates='drop')
+            new_features[f'bucket_{c1}_x_{c2}'] = b1 * 5 + b2
 
     # Early Warning
     # [WHY_THIS_DESIGN] Justified Heuristic for Early Warning
@@ -1414,13 +1432,16 @@ def add_extreme_detection_features(df, extreme_quantiles=None):
     return pd.concat([df, ext_df], axis=1)
 
 def load_data():
-    train = pd.read_csv(f"{Config.DATA_PATH}train.csv")
-    test = pd.read_csv(f"{Config.DATA_PATH}test.csv")
+    train = pd.read_csv(os.path.join(Config.DATA_PATH, "train.csv"))
+    test = pd.read_csv(os.path.join(Config.DATA_PATH, "test.csv"))
     layout = pd.read_csv(Config.LAYOUT_PATH)
     
     # [STRUCTURAL_REALIGNMENT] Target Renaming
-    # The source CSV uses avg_delay_minutes_next_30m, but the pipeline
-    # uses Config.TARGET ('target') as the Single Source of Truth.
+    # [ROLLBACK] Log-transform REMOVED. Root cause of distribution collapse:
+    #   log1p compressed the target scale, and expm1 inverse exponentially amplified
+    #   prediction errors, causing mean_ratio=5.39, std_ratio=12.10, ADV AUC=0.99.
+    # [LESSON] Target must stay in REAL minutes. Tail improvement must come from
+    #   model capacity and moderate weighting, NOT target transformation.
     if 'avg_delay_minutes_next_30m' in train.columns:
         train = train.rename(columns={'avg_delay_minutes_next_30m': Config.TARGET})
     

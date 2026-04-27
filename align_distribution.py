@@ -35,14 +35,13 @@ def align_distribution():
         train_p99 = float(target.quantile(0.99))
         
         # Update artifact for future use
-        os.makedirs(os.path.dirname(stats_path), exist_ok=True)
-        with open(stats_path, 'w') as f:
-            json.dump({
-                "mean": train_mean,
-                "std": train_std,
-                "p90": train_p90,
-                "p99": train_p99
-            }, f, indent=2)
+        from src.utils import save_json
+        save_json({
+            "mean": train_mean,
+            "std": train_std,
+            "p90": train_p90,
+            "p99": train_p99
+        }, stats_path)
         print(f"  Artifact updated: {stats_path}")
 
     print(f"  [TRAIN] Mean: {train_mean:.4f} | Std: {train_std:.4f} | P90: {train_p90:.4f} | P99: {train_p99:.4f}")

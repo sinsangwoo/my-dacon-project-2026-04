@@ -272,7 +272,7 @@ def run_phase(phase, mode, smoke_test=False):
 
         elif phase == '8_submission':
             final_preds = load_npy(f'{Config.PREDICTIONS_PATH}/final_submission.npy')
-            sample_sub = pd.read_csv(Config.DATA_PATH + 'sample_submission.csv')
+            sample_sub = pd.read_csv(os.path.join(Config.DATA_PATH, 'sample_submission.csv'))
             sub, f_hash = build_submission(final_preds, sample_sub['ID'].values[:len(final_preds)])
             validate_submission(sub, sample_sub.iloc[:len(final_preds)], logger)
             logger.info(f"[DONE] Fingerprint: {f_hash}")

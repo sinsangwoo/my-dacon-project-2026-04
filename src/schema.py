@@ -99,14 +99,17 @@ def get_feature_schema():
         for s in EXTREME_SUFFIXES:
             raw_features.append(f"{col}{s}")
             
-    # Interactions
-    interaction_pairs = [
-        ('order_inflow_15m', 'robot_utilization'),
-        ('heavy_item_ratio', 'order_inflow_15m'),
-        ('heavy_item_ratio', 'robot_utilization'),
-    ]
-    for f1, f2 in interaction_pairs:
+    # [STRUCTURAL_FIX] Dynamic Interaction Engine (v16.5)
+    # [ROOT_CAUSE] Previous hardcoded logic (3 features) caused Interaction=0 survivors.
+    # [SOLUTION] Iterate through top sensor pairs to explore the sensor interaction space.
+    interaction_targets = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'battery_std', 'heavy_item_ratio']
+    import itertools
+    for f1, f2 in itertools.combinations(interaction_targets, 2):
         raw_features.append(f"inter_{f1}_x_{f2}")
+        raw_features.append(f"ratio_{f1}_to_{f2}")
+        raw_features.append(f"diff_{f1}_{f2}")
+        raw_features.append(f"logprod_{f1}_{f2}")
+        raw_features.append(f"bucket_{f1}_x_{f2}")
         
     raw_features.extend(["early_warning_flag", "early_warning_score", "is_extreme", "is_extreme_multi"])
     

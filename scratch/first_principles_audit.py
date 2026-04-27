@@ -1,78 +1,63 @@
-
-import os
+import json
 import pandas as pd
 import numpy as np
-import logging
-from src.config import Config
-from src.data_loader import load_data, infer_feature_types, add_time_series_features, add_extreme_detection_features
-from src.schema import BASE_COLS, FEATURE_SCHEMA
 
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("FirstPrinciplesAudit")
+run_id = "run_20260427_023656"
+log_path = f"outputs/{run_id}/processed/signal_validation_logs.json"
 
-def run_audit():
-    logger.info("Loading data for First-Principles Audit...")
-    train, _ = load_data()
-    
-    # Generate all current features
-    df_ts = add_time_series_features(train.iloc[:20000].copy())
-    df_ext = add_extreme_detection_features(df_ts)
-    
-    # Identify TS features
-    ts_cols = [c for c in df_ext.columns if any(suffix in c for suffix in ['_rolling_', '_diff_', '_rate_', '_slope_', '_expanding_', '_rel_', '_accel', '_regime', '_consecutive'])]
-    
-    # 1. Cluster Analysis: Group features by signal type across all base columns
-    suffixes = [
-        '_rolling_mean_5', '_rolling_std_5', '_diff_1', '_rate_1', '_slope_5', 
-        '_expanding_mean', '_rel_to_mean_5', '_rel_rank_5', '_accel', 
-        '_volatility_expansion_std', '_regime_id', '_consecutive_above_q75'
-    ]
-    
-    signal_overlap = {}
-    for s in suffixes:
-        cols = [c for c in ts_cols if c.endswith(s)]
-        if not cols: continue
-        
-        # Mean correlation of this signal across all base columns vs others
-        # (This is hard to summarize globally, let's pick top 5 base columns)
-        top_base = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'avg_trip_distance', 'unique_sku_15m']
-        
-        for base in top_base:
-            base_feats = [c for c in ts_cols if c.startswith(base)]
-            if not base_feats: continue
-            
-            corr = df_ext[base_feats].corr().abs()
-            
-            # Find what this suffix overlaps with
-            target_feat = f"{base}{s}"
-            if target_feat not in corr.columns: continue
-            
-            high_corr = corr[target_feat][(corr[target_feat] > 0.85) & (corr.index != target_feat)]
-            if not high_corr.empty:
-                for idx, val in high_corr.items():
-                    pair = tuple(sorted([target_feat, idx]))
-                    signal_overlap[pair] = val
+with open(log_path, 'r') as f:
+    data = json.load(f)
 
-    logger.info("--- HIGH REDUNDANCY CLUSTERS (>0.85) ---")
-    sorted_overlap = sorted(signal_overlap.items(), key=lambda x: x[1], reverse=True)
-    for pair, val in sorted_overlap[:30]:
-        logger.info(f"{pair[0]:<40} vs {pair[1]:<40} | Corr: {val:.4f}")
+val_logs = data['val_logs']
+noise_proof = data['noise_proof']
 
-    # 2. Heuristic Sensitivity Analysis
-    logger.info("--- HEURISTIC SENSITIVITY ---")
-    # Clipping ranges
-    target = train[Config.TARGET]
-    p1, p99 = target.quantile(0.01), target.quantile(0.99)
-    p05, p995 = target.quantile(0.005), target.quantile(0.995)
-    logger.info(f"Target Clipping: [P1, P99] = [{p1:.2f}, {p99:.2f}] | [P0.5, P99.5] = [{p05:.2f}, {p995:.2f}]")
-    
-    # Correlation distribution
-    sample_df = df_ext[ts_cols].sample(n=5000, random_state=42).fillna(0)
-    corr_matrix = sample_df.corr().abs()
-    upper_tri = corr_matrix.where(np.triu(np.ones(corr_matrix.shape), k=1).astype(bool)).values.flatten()
-    upper_tri = upper_tri[~np.isnan(upper_tri)]
-    
-    logger.info(f"Global Correlation Percentiles: P90={np.percentile(upper_tri, 90):.4f}, P95={np.percentile(upper_tri, 95):.4f}, P99={np.percentile(upper_tri, 99):.4f}")
+df = pd.DataFrame(val_logs)
 
-if __name__ == "__main__":
-    run_audit()
+# 1. Noise Gate Audit
+max_noise_gain = noise_proof['noise_max_gain']
+# In current code: beats_noise_gain = gain > max_noise_gain * 0.5
+# In current code: beats_noise_perm = p_data['delta'] > max(max_noise_perm * 2.0, 0.0005)
+# Wait, max_noise_perm is not explicitly in the root but I can find it from logs if I look at __noise_ features
+# But the logs I have are only for candidates. 
+# Wait, let's see if __noise_ features are in val_logs.
+noise_entries = [v for v in val_logs if v['feature'].startswith('__noise_')]
+if noise_entries:
+    max_noise_perm = max([v['perm_delta'] for v in noise_entries])
+else:
+    # Estimate from beats_noise_perm logic
+    max_noise_perm = 0 # Fallback
+
+# Features that pass ONLY via gain
+pass_only_gain = df[(df['beats_noise_gain'] == True) & (df['beats_noise_perm'] == False)]
+# Features that pass ONLY via perm
+pass_only_perm = df[(df['beats_noise_gain'] == False) & (df['beats_noise_perm'] == True)]
+# Features that pass BOTH
+pass_both = df[(df['beats_noise_gain'] == True) & (df['beats_noise_perm'] == True)]
+
+print(f"--- NOISE GATE AUDIT ---")
+print(f"Total Evaluated: {len(df)}")
+print(f"Pass Both: {len(pass_both)}")
+print(f"Pass Only Gain: {len(pass_only_gain)}")
+print(f"Pass Only Perm: {len(pass_only_perm)}")
+
+# 2. Signal Gate Audit (perm_delta > 0)
+small_positive = df[(df['perm_delta'] > 0) & (df['perm_delta'] < 0.0005)]
+print(f"\n--- SIGNAL GATE AUDIT ---")
+print(f"Features with small positive perm_delta (< 0.0005): {len(small_positive)}")
+
+# 3. KS Audit
+high_ks = df[df['ks_stat'] > 0.5]
+v_high_ks = df[df['ks_stat'] > 0.8]
+print(f"\n--- KS AUDIT ---")
+print(f"KS > 0.5: {len(high_ks)}")
+print(f"KS > 0.8: {len(v_high_ks)}")
+
+# 4. Generalization Audit (Stability Factor)
+low_stability = df[df['sign_stability'] < 1.0] # Not all folds have same sign
+print(f"\n--- GENERALIZATION AUDIT ---")
+print(f"Features with sign instability (sign_stability < 1.0): {len(low_stability)}")
+
+# Sample of questionable features (Passed but weak/unstable)
+questionable = df[(df['passed'] == True) & ((df['beats_noise_gain'] == False) | (df['sign_stability'] < 1.0) | (df['ks_stat'] > 0.5))]
+print(f"\n--- QUESTIONABLE SURVIVORS ---")
+print(questionable[['feature', 'gain', 'perm_delta', 'ks_stat', 'sign_stability']].head(20))

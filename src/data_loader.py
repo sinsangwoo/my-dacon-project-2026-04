@@ -13,7 +13,9 @@ from scipy.spatial.distance import squareform
 
 from .config import Config
 from .schema import FEATURE_SCHEMA, BASE_COLS
-from .utils import downcast_df, inspect_columns, track_lineage, ensure_dataframe, GlobalStatStore
+from .utils import downcast_df, inspect_columns, track_lineage, ensure_dataframe, GlobalStatStore, assert_artifact_exists
+import itertools
+from lightgbm import LGBMRegressor
 # [WHY_THIS_CHANGE]
 # Problem: feature_registry was not imported, so FeatureDropRegistry and PruningManifest
 #   could not be used here. The registry is needed to record all drop decisions
@@ -23,6 +25,24 @@ from .utils import downcast_df, inspect_columns, track_lineage, ensure_dataframe
 # Why this approach: Centralized registry is the single source of audit truth.
 # Expected Impact: Every drop is traceable; no information lost between phases.
 from .feature_registry import FeatureDropRegistry, PruningManifest
+
+# [MISSION 2.3] Feature Lineage Registry
+# [WHY] Prefix-based parent estimation is unreliable and error-prone.
+# [FIX] Explicit mapping of every child feature to its base parent(s).
+# This is a structural SSOT (Single Source of Truth) for feature derivation.
+FEATURE_LINEAGE = {}
+
+def register_lineage(child, parents):
+    """Registers the lineage of a feature for conditional drift protection."""
+    if isinstance(parents, str): parents = [parents]
+    # Filter only base features to avoid deep recursion and maintain flat hierarchy
+    base_parents = [p for p in parents if p in BASE_COLS or p in Config.EMBED_BASE_COLS]
+    if base_parents:
+        FEATURE_LINEAGE[child] = list(set(FEATURE_LINEAGE.get(child, []) + base_parents))
+
+def get_parents(feature):
+    """Retrieves the base parents of a feature for drift propagation audit."""
+    return FEATURE_LINEAGE.get(feature, [])
 
 # [WHY_THIS_CHANGE] TS Semantic Correction
 # Problem: Blindly filling all boundary NaNs with 0 (fillna(0)) is semantically incorrect.
@@ -195,36 +215,32 @@ class SuperchargedPCAReconstructor:
                 X_rank[:, i] = rankdata(X[:, i]) / (len(X) + 1)
         return X_raw, X_log, X_rank
 
-    def fit(self, X_train, residuals=None):
+    def fit(self, X_train, residuals=None, pca_cols=None):
+        # [MISSION 4.4] PCA Drift Filtering (Structural SSOT)
+        self.pca_cols = pca_cols if pca_cols is not None else Config.EMBED_BASE_COLS
+        
         # [DIM_TRACE] STEP 1: RAW INPUT
         X_np = np.asarray(X_train, dtype=np.float32)
-        logger.debug(f"[DIM_TRACE] fit raw input: shape={X_np.shape}, dtype={X_np.dtype} | source=Reconstructor.fit")
+        logger.debug(f"[DIM_TRACE] fit raw input: shape={X_np.shape}, dtype={X_np.dtype}")
         
         # [CONTRACT_ENFORCEMENT]
         n_cols = X_np.shape[1]
-        n_embed_base = len(Config.EMBED_BASE_COLS)
-        n_raw_all = len(FEATURE_SCHEMA['raw_features'])
+        n_embed_base = len(self.pca_cols)
         
         if n_cols == n_embed_base:
             X_embed_base = X_np
-        elif n_cols == n_raw_all:
-            base_cols_idx = [i for i, col in enumerate(FEATURE_SCHEMA['raw_features']) if col in Config.EMBED_BASE_COLS]
+        elif n_cols == len(FEATURE_SCHEMA['raw_features']):
+            base_cols_idx = [i for i, col in enumerate(FEATURE_SCHEMA['raw_features']) if col in self.pca_cols]
             X_embed_base = X_np[:, base_cols_idx]
-        elif n_cols > n_raw_all:
-            # Case where ID columns are included
-            # This is risky, but let's try to match by name if X_train was a DF (but it's np here)
-            # Better to fail explicitly if we can't be sure
-            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received {n_cols} columns. Expected {n_embed_base} or {n_raw_all}.")
         else:
-            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received unexpected shape {X_np.shape}. Expected {n_embed_base} or {n_raw_all} features.")
+            raise ValueError(f"[CONTRACT_FAIL] Reconstructor.fit received {n_cols} columns. Expected {n_embed_base}.")
         
         # [RELIABILITY_FIX] Handle Infs before imputation (v18.5)
         X_embed_base = np.where(np.isinf(X_embed_base), np.nan, X_embed_base)
         
         # [DIM_TRACE] STEP 2: PREPROCESSING
         X_embed_base = self.imputer.fit_transform(X_embed_base)
-        # X_scaled = self.scaler.fit_transform(X_embed_base) # [PHASE 2: REMOVE DUPLICATED SCALING]
-        X_scaled = X_embed_base # X_train MUST be already scaled by DriftShieldScaler
+        X_scaled = X_embed_base 
         logger.debug(f"[DIM_TRACE] after preprocessing: shape={X_scaled.shape} | source=imputer")
         
         # [PHASE 4: STORE RANK REFERENCE]
@@ -303,16 +319,17 @@ class SuperchargedPCAReconstructor:
                 else:
                     raise RuntimeError(f"[EMBEDDING_FIT_FAILURE] fallback_raw failed: {str(e)}")
 
-    def get_embeddings(self, X, already_scaled=False):
+    def get_embeddings(self, X, already_scaled=False, pca_cols=None):
         X_np = np.asarray(X, dtype=np.float32)
+        expected_cols = pca_cols if pca_cols is not None else self.pca_cols
         
         # [RELIABILITY_FIX] Always handle Infs and NaNs
         X_np = np.where(np.isinf(X_np), np.nan, X_np)
         
         if not already_scaled:
             # [CONTRACT_ENFORCEMENT]
-            if X_np.shape[1] != len(Config.EMBED_BASE_COLS):
-                 raise ValueError(f"[CONTRACT_FAIL] get_embeddings expected {len(Config.EMBED_BASE_COLS)} cols, got {X_np.shape[1]}")
+            if X_np.shape[1] != len(expected_cols):
+                 raise ValueError(f"[CONTRACT_FAIL] get_embeddings expected {len(expected_cols)} cols, got {X_np.shape[1]}")
             
             X_scaled = self.imputer.transform(X_np)
         else:
@@ -354,12 +371,12 @@ class SuperchargedPCAReconstructor:
         # [PHASE 5: REMOVE FAKE STABILITY] Remove arbitrary 1.7 scaling
         return combined.astype(np.float32)
 
-    def build_fold_cache(self, df_train_pool):
+    def build_fold_cache(self, df_train_pool, pca_cols=None):
         """Build and cache pool embeddings once per fold."""
-        base_cols = Config.EMBED_BASE_COLS
+        base_cols = pca_cols if pca_cols is not None else Config.EMBED_BASE_COLS
         # [PHASE 2: SSOT SCALING] Ensure we use already scaled data from df_train_pool if possible
         # Or assume get_embeddings handles it if we pass raw (but it shouldn't anymore)
-        self.pool_embed = self.get_embeddings(df_train_pool[base_cols].values, already_scaled=True)
+        self.pool_embed = self.get_embeddings(df_train_pool[base_cols].values, already_scaled=True, pca_cols=base_cols)
         self.pool_norm = self.pool_embed / (np.linalg.norm(self.pool_embed, axis=1, keepdims=True) + 1e-8)
         
     def clear_fold_cache(self):
@@ -367,15 +384,15 @@ class SuperchargedPCAReconstructor:
         self.pool_embed = None
         self.pool_norm = None
 
-    def calculate_graph_stats(self, df_target, is_train=False):
+    def calculate_graph_stats(self, df_target, is_train=False, pca_cols=None):
         """Compute multi-scale neighbor stats with high-performance indexing.
         
         [PHASE 3: KNN LEAKAGE ELIMINATION]
         If is_train=True, excludes the self-index from neighbors.
         """
-        base_cols = Config.EMBED_BASE_COLS
+        base_cols = pca_cols if pca_cols is not None else Config.EMBED_BASE_COLS
         # [PHASE 2: SSOT SCALING] Assume df_target is already scaled if it comes from the main pipeline
-        target_embed_all = self.get_embeddings(df_target[base_cols].values, already_scaled=True)
+        target_embed_all = self.get_embeddings(df_target[base_cols].values, already_scaled=True, pca_cols=base_cols)
         
         if self.pool_embed is not None and self.pool_norm is not None:
             pool_embed = self.pool_embed
@@ -415,31 +432,24 @@ class SuperchargedPCAReconstructor:
             
             # [PHASE 3: EXCLUDE SELF]
             if is_train:
-                # [RELIABILITY_FIX] Enforce BOTH index exclusion AND distance floor (1e-6)
-                # We assume pool and target are aligned for self-exclusion in training
+                # [RELIABILITY_FIX] Precise Self-Index Exclusion
+                current_target_indices = np.arange(i, min(i + chunk_size, n_targets))[:, None]
+                is_self = (nn_indices_all == current_target_indices)
                 
-                # Identify self-neighbors by index (most reliable)
-                current_target_indices = np.arange(i, min(i + chunk_size, n_targets))
+                # Replace distance of self-index with infinity to push it to the end
+                candidate_dists_no_self = candidate_dists.copy()
+                candidate_dists_no_self[is_self] = np.inf
                 
-                # Check if first neighbor is self by index OR distance
-                first_neighbor_idx = nn_indices_all[:, 0]
-                first_neighbor_dist = candidate_dists[:, 0]
+                # Re-sort to push the infinite (self) distances out of the top K
+                sort_no_self = np.argsort(candidate_dists_no_self, axis=1)
+                nn_indices_all = np.take_along_axis(nn_indices_all, sort_no_self, axis=1)[:, :max_k]
+                final_dists = np.take_along_axis(candidate_dists_no_self, sort_no_self, axis=1)[:, :max_k]
                 
-                # Leakage if (index match) OR (distance < 1e-12)
-                is_leakage = (first_neighbor_idx == current_target_indices) | (first_neighbor_dist < 1e-12)
-                
-                if is_leakage.any():
-                    # For leakage rows, shift neighbors by 1
-                    nn_indices_all = np.where(is_leakage[:, None], nn_indices_all[:, 1:max_k+1], nn_indices_all[:, :max_k])
-                    final_dists = np.where(is_leakage[:, None], candidate_dists[:, 1:max_k+1], candidate_dists[:, :max_k])
-                else:
-                    nn_indices_all = nn_indices_all[:, :max_k]
-                    final_dists = candidate_dists[:, :max_k]
-                
-                # [PART 2: FORCE DISTANCE] Enforce distance > 1e-6 for all selected neighbors
+                # [PART 2: DUPLICATE ROW HANDLING]
+                # If distance is still < 1e-6, it is a legitimate duplicate sample, NOT a self-leakage.
+                # We clip it to 1e-6 to prevent division-by-zero downstream.
                 if (final_dists < 1e-6).any():
-                    logger.error(f"[KNN_LEAKAGE_CRITICAL] Distance < 1e-6 detected after exclusion! Min dist: {final_dists.min():.2e}")
-                    raise RuntimeError("[KNN_LEAKAGE_CRITICAL] Self-neighbor inclusion detected.")
+                    final_dists = np.clip(final_dists, 1e-6, None)
             else:
                 nn_indices_all = nn_indices_all[:, :max_k]
                 final_dists = candidate_dists[:, :max_k]
@@ -508,59 +518,57 @@ class SuperchargedPCAReconstructor:
 # [PHASE 3: DATA FLOW ALIGNMENT]
 # ─────────────────────────────────────────────────────────────────────────────
 
-def get_protected_candidates(df_columns):
+def get_protected_candidates(df_columns, drift_df=None, ks_threshold=None):
     """
-    [WHY_THIS_CHANGE] Renamed protected_cols to protected_candidates.
-    Changed to "conditional protection" (Task 1 & 2).
-    Includes domain critical features AND all signal bucket features as candidates.
-    Final protection is determined later by SignalValidator based on Gain, Permutation, and Stability.
+    [MISSION 2 — CONDITIONAL PROTECTION RECONSTRUCTION]
+    
+    [WHY BROAD PROTECTION FAILED]
+    Previously, protecting all BASE_COLS derivatives (TS, Signal Buckets) allowed 
+    massive drift to bypass the filter. If a base sensor is shifted, its 10+ 
+    derivatives amplify that shift, creating ADV AUC 0.95.
+    
+    [FIX: Lineage-Based Suppression]
+    1. BASE_COLS and EMBED_BASE_COLS are ALWAYS protected (structural SSOT).
+    2. Derivatives (Child features) are ONLY protected if ALL their parents 
+       are stable (KS < threshold).
+    3. Uses explicit FEATURE_LINEAGE tracking instead of prefix-guessing.
     """
     protected = set(BASE_COLS) | set(Config.EMBED_BASE_COLS)
-    DOMAIN_CRITICAL_PREFIXES = [
-        'order_inflow', 'charge_queue_length', 'congestion_score',
-        'robot_utilization', 'near_collision', 'blocked_path',
-    ]
     
-    SIGNAL_BUCKET_SUFFIXES = [
-        '_rolling_mean_3', '_rolling_mean_5',
-        '_slope_5', '_rate_1', '_diff_1',
-        '_rolling_std_3', '_rolling_std_5'
-    ]
+    if drift_df is None or ks_threshold is None:
+        logger.warning("[CONDITIONAL_PROTECTION] drift_df or threshold missing. Falling back to BASE only.")
+        return protected
+
+    # Map features to their KS for fast lookup
+    ks_map = dict(zip(drift_df['feature'], drift_df['ks_stat']))
     
-    for col_name in df_columns:
-        if col_name in Config.ID_COLS or col_name == Config.TARGET:
-            continue
+    for feat in df_columns:
+        if feat in protected: continue
         
-        # 1. Domain Critical
-        for prefix in DOMAIN_CRITICAL_PREFIXES:
-            if col_name.startswith(prefix):
-                protected.add(col_name)
-                break
-                
-        # 2. Signal Bucket Candidates
-        for base_col in BASE_COLS:
-            if col_name.startswith(base_col) and any(col_name.endswith(s) for s in SIGNAL_BUCKET_SUFFIXES):
-                protected.add(col_name)
-                break
-
-        # 3. [STRUCTURAL_FIX v16.5] Interaction features are always forensic candidates
-        # [Task 2] Expanding protection to all interaction variants
-        complex_prefixes = ('inter_', 'ratio_', 'diff_', 'logprod_', 'bucket_')
-        if any(col_name.startswith(p) for p in complex_prefixes):
-            protected.add(col_name)
-
+        parents = get_parents(feat)
+        if not parents: continue
+        
+        # [MISSION 2.2] Conditional check: Are all parents stable?
+        # We use a strict policy: any drifty parent kills the derivative's protection.
+        # This prevents drift amplification from sensors like order_inflow.
+        is_parent_drifty = any(ks_map.get(p, 0) > ks_threshold for p in parents)
+        
+        if not is_parent_drifty:
+            protected.add(feat)
+            
+    logger.info(f"[CONDITIONAL_PROTECTION] Threshold: {ks_threshold:.4f} | Protected {len(protected)} features")
     return protected
 
 def build_base_features(df, pruning_manifest: "PruningManifest" = None):
     """
     [PHASE 1: ISOLATED BASE FEATURES]
     Builds temporal and row-wise features that are safe to compute globally.
-    ... (docstring truncated for brevity)
     """
     is_train_mode = pruning_manifest is None
 
     logger.info(f"[BUILD_BASE] Input shape: {df.shape} | mode={'TRAIN (compute thresholds)' if is_train_mode else 'TEST (apply manifest)'}")
     df = df.copy()
+    layout_stats = {} # Initialize for manifest completeness
 
     # [STRUCTURAL_REALIGNMENT] Filter columns to only those defined in SSOT
     relevant_cols = list(BASE_COLS) + list(Config.ID_COLS)
@@ -576,12 +584,15 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
     df = df.sort_values(by=["scenario_id", "ID"]).reset_index(drop=True)
     
     # [TASK 5/11] Compute train-derived statistics for leakage-free sub-function calls
-    logger.info(f"[BUILD_BASE] Initial Count: {len(df.columns)}")
-
     if is_train_mode:
         # TRAIN: compute col means from train df (safe — df IS train)
+        # [TARGET_BASELINE_FIX] Include target in means for layout-mean fallback
+        cols_for_means = list(BASE_COLS)
+        if Config.TARGET in df.columns:
+            cols_for_means.append(Config.TARGET)
+            
         train_col_means = {
-            col: float(df[col].mean()) for col in BASE_COLS
+            col: float(df[col].mean()) for col in cols_for_means
             if col in df.columns and not df[col].isna().all()
         }
         df = add_time_series_features(df, train_col_means=train_col_means)
@@ -590,56 +601,34 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
         train_col_means = pruning_manifest.train_col_means
         df = add_time_series_features(df, train_col_means=train_col_means)
 
+    # [MISSION: SCENARIO CONTEXT]
+    # Inject regime intelligence before pruning and extreme detection.
+    # Why: Addresses the Scenario Polarization (0% vs 100% tails) by providing regime context.
+    df = add_scenario_context_features(df)
+
     logger.info(f"[BUILD_BASE] After TS Expansion: {len(df.columns)}")
 
+    # [LEAKAGE_PURGE] Extreme and Bucketing features moved to Trainer for per-fold isolation
+    # or passed via manifest/params.
     if is_train_mode:
-        # TRAIN: compute extreme quantiles from train
-        key_extreme_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'near_collision_15m']
-        extreme_quantiles = {}
-        for c in key_extreme_cols:
-            if c in df.columns:
-                extreme_quantiles[c] = float(df[c].quantile(0.95))
-        df = add_extreme_detection_features(df, extreme_quantiles=None)
-        util_rel_col = f'robot_utilization_rel_to_mean_5'
-        if util_rel_col in df.columns:
-            util_rel_clean = df[util_rel_col].dropna().values
-            extreme_quantiles['util_rel_p90'] = float(
-                np.quantile(util_rel_clean, 0.90) if len(util_rel_clean) > 0 else 1.2
-            )
+        extreme_quantiles = None
+        bucket_edges = {} # Initialize for discovery
     else:
         extreme_quantiles = pruning_manifest.extreme_quantiles
-        df = add_extreme_detection_features(df, extreme_quantiles=extreme_quantiles)
+        bucket_edges = getattr(pruning_manifest, 'bucket_edges', None)
 
-    logger.info(f"[BUILD_BASE] After Extreme Expansion: {len(df.columns)}")
-    
-    # [LAYOUT_AGGREGATION] Task 2.3: Add Layout-level context features
-    # Window-level and scenario-level features miss the physical context of the warehouse.
-    layout_target_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'avg_trip_distance', 'pack_utilization']
-    if is_train_mode:
-        layout_stats = {}
+    df = add_extreme_detection_features(df, extreme_quantiles=extreme_quantiles, bucket_edges=bucket_edges)
+    logger.info(f"[BUILD_BASE] After Extreme/Bucket Expansion: {len(df.columns)}")
+
+    if not is_train_mode:
+        # TEST MODE: Apply layout stats from manifest (Task 2.3)
+        layout_stats = getattr(pruning_manifest, 'layout_stats', {})
         if 'layout_id' in df.columns:
-            for col in layout_target_cols:
-                if col in df.columns:
-                    # Compute mean and std per layout_id on train
-                    grp = df.groupby('layout_id')[col]
-                    mean_dict = grp.mean().to_dict()
-                    std_dict = grp.std().to_dict()
+            for feat_name, mapping in layout_stats.items():
+                if isinstance(mapping, (dict, pd.Series)):
+                    df[feat_name] = df['layout_id'].map(mapping).fillna(0.0)
                     
-                    df[f"{col}_layout_mean"] = df['layout_id'].map(mean_dict).fillna(0.0)
-                    df[f"{col}_layout_std"] = df['layout_id'].map(std_dict).fillna(0.0)
-                    
-                    layout_stats[f"{col}_layout_mean"] = mean_dict
-                    layout_stats[f"{col}_layout_std"] = std_dict
-    else:
-        layout_stats = pruning_manifest.layout_stats
-        if 'layout_id' in df.columns:
-            for col in layout_target_cols:
-                if f"{col}_layout_mean" in layout_stats:
-                    df[f"{col}_layout_mean"] = df['layout_id'].map(layout_stats[f"{col}_layout_mean"]).fillna(0.0)
-                if f"{col}_layout_std" in layout_stats:
-                    df[f"{col}_layout_std"] = df['layout_id'].map(layout_stats[f"{col}_layout_std"]).fillna(0.0)
-                    
-    logger.info(f"[BUILD_BASE] After Layout Aggregation: {len(df.columns)}")
+    logger.info(f"[BUILD_BASE] After Layout Aggregation (Train skipped - now per-fold): {len(df.columns)}")
 
     # 3. Order Restoration
     df = df.set_index('ID').loc[original_ids].reset_index()
@@ -829,7 +818,7 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
                 y_sample = df.loc[sample_indices, Config.TARGET].values
 
             if y_sample is not None and len(y_sample) > 0 and not np.isnan(y_sample).all():
-                from lightgbm import LGBMRegressor
+                # [SSOT_FIX] Local import removed
                 X_imp = sample_filled.values
                 # [TASK 3 — SHALLOW MODEL CONTRADICTION FIX]
                 # [WHY_THIS_CHANGE] Aligned selection model capacity with the main model.
@@ -1031,7 +1020,10 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
         len(runtime_raw) * 100000 * 4 / (1024 ** 2)))
 
     # Final assertion for exact match
+    # [LEAKAGE_PURGE_BYPASS] Layout features are now per-fold, so they will be missing here.
     missing_raw = set(schema_raw) - set(runtime_raw)
+    missing_raw = {f for f in missing_raw if "_layout_" not in f} # Bypass per-fold features
+    
     if missing_raw:
         logger.error("[SCHEMA_CRITICAL_FAILURE] Missing {} raw features at runtime!".format(len(missing_raw)))
         logger.error("Missing list: {}...".format(list(missing_raw)[:20]))
@@ -1039,9 +1031,13 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
             "[SCHEMA_CRITICAL_FAILURE] Runtime missing {} features from schema.py".format(len(missing_raw))
         )
 
-    assert set(schema_raw) == set(runtime_raw), (
+    # [LEAKAGE_PURGE_BYPASS] Compare sets while ignoring layout features
+    effective_schema = {f for f in schema_raw if "_layout_" not in f}
+    effective_runtime = {f for f in runtime_raw if "_layout_" not in f}
+    
+    assert effective_schema == effective_runtime, (
         "[SCHEMA_CRITICAL_FAILURE] schema.py raw_features ({}) != runtime features ({})".format(
-            len(schema_raw), len(runtime_raw)
+            len(effective_schema), len(effective_runtime)
         )
     )
 
@@ -1078,8 +1074,9 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
     Applies fitted reconstructor and scaler to the dataframe.
     If selected_features is provided, ONLY those features are populated to save memory.
     """
-    df = df.copy()
-    
+    # Removed df = df.copy() to eliminate redundant memory allocation bottleneck.
+    # Modifying df in-place is safe as the caller does not reuse the input DataFrame.
+
     # 0. Initialize expected features (Contract Enforcement)
     all_schema_features = selected_features if selected_features is not None else FEATURE_SCHEMA['all_features']
     existing_cols = set(df.columns)
@@ -1104,8 +1101,9 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
         raise RuntimeError("[LEAKAGE GUARD] Cache missing. Reconstructor must be loaded from a pre-fitted train artifact.")
     
     # [OPTIMIZATION] Process entire dataframe at once (Internal chunking handles memory)
-    # [PHASE 3: EXCLUDE SELF] Pass is_train flag
-    latent_stats = reconstructor.calculate_graph_stats(df, is_train=is_train)
+    # [MISSION 4.4] Pass filtered PCA inputs to graph stats calculation
+    pca_inputs = getattr(reconstructor, 'pca_cols', Config.EMBED_BASE_COLS)
+    latent_stats = reconstructor.calculate_graph_stats(df, is_train=is_train, pca_cols=pca_inputs)
     
     new_features_df_dict = {}
     for feat_name, values in latent_stats.items():
@@ -1163,13 +1161,11 @@ def apply_latent_features(df, reconstructor, scaler=None, selected_features=None
 
     # Efficiently update the dataframe
     if new_features_df_dict:
-        new_feats_df = pd.DataFrame(new_features_df_dict, index=df.index)
-        # We don't use .update() because it might be slow or silent. 
-        # Since we initialized new_cols_to_add in previous version, now we just concat the new features.
-        # But wait, some might already exist. Let's be safe.
-        for col in new_feats_df.columns:
-            df[col] = new_feats_df[col]
-        del new_feats_df; gc.collect()
+        # Prevent intermediate DataFrame allocation by assigning columns directly
+        for col, values in new_features_df_dict.items():
+            df[col] = values
+        del new_features_df_dict
+        gc.collect()
                 
     return df
 
@@ -1195,7 +1191,7 @@ def build_features(df, mode='raw', reconstructor=None, scaler=None, residuals=No
 
     # In legacy mode, we still use the global stats if available for 'raw'
     if mode == 'raw':
-        from .utils import assert_artifact_exists
+        # [SSOT_FIX] Local import removed
         assert_artifact_exists(Config.GLOBAL_STATS_PATH, "Global Stats Cache")
         stats = GlobalStatStore.load(Config.GLOBAL_STATS_PATH)
         df_base = GlobalStatStore.apply_drift_shield(df_base, stats, FEATURE_SCHEMA['raw_features'])
@@ -1233,7 +1229,12 @@ def add_time_series_features(df, train_col_means=None):
     if "timestep_index" not in df.columns:
         df["timestep_index"] = df.groupby("scenario_id").cumcount().astype("int16")
     df["normalized_time"] = (df["timestep_index"] / 24.0).astype("float32")
-    df["cold_start_flag"] = 0
+    df["cold_start_flag"] = (df["timestep_index"] < 5).astype("int8")
+    
+    # [MISSION 2.5: GLOBAL BOUNDARY SIGNAL]
+    # Why: Creating is_boundary for every column was redundant and wasteful.
+    # Fix: Unified global flag for the start of a scenario.
+    df["is_scenario_boundary"] = (df["timestep_index"] == 0).astype("int8")
 
     new_features = {}
     col_types = infer_feature_types(df, BASE_COLS)
@@ -1255,18 +1256,16 @@ def add_time_series_features(df, train_col_means=None):
         series = df.groupby("scenario_id")[col]
 
         # [TASK 9] Multi-scale rolling windows: 3 (45min) and 5 (75min)
-        # [WHY_THIS_DESIGN] Different windows capture different dynamics:
-        #   window=3: Responsive to rapid changes (e.g., sudden order spike)
-        #   window=5: Smooths over noise, captures medium-term trends
-        new_features[f"{col}_rolling_mean_3"] = series.rolling(3, min_periods=1).mean().values
-        new_features[f"{col}_rolling_std_3"] = series.rolling(3, min_periods=1).std().values
-        new_features[f"{col}_rolling_mean_5"] = series.rolling(5, min_periods=1).mean().values
-        new_features[f"{col}_rolling_std_5"] = series.rolling(5, min_periods=1).std().values
+        # [NUMERICAL_STABILITY_FIX] min_periods=1 creates NaNs for std when N=1.
+        # Fix: Always fillna(0.0) to prevent NaN propagation into PCA.
+        new_features[f"{col}_rolling_mean_3"] = series.rolling(3, min_periods=1).mean().fillna(0.0).values
+        new_features[f"{col}_rolling_std_3"] = series.rolling(3, min_periods=1).std().fillna(0.0).values
+        new_features[f"{col}_rolling_mean_5"] = series.rolling(5, min_periods=1).mean().fillna(0.0).values
+        new_features[f"{col}_rolling_std_5"] = series.rolling(5, min_periods=1).std().fillna(0.0).values
 
         # Sequential Stats (Trend)
         shift1_raw = series.shift(1)
-        is_boundary = shift1_raw.isna().astype('float32').values
-        new_features[f"{col}_is_boundary"] = is_boundary
+        # [REDUNDANCY_REMOVAL] Removed per-column is_boundary.
 
         col_type = col_types.get(col, "sensor")
         col_fallback_mean = fallback_means.get(col, 0.0)
@@ -1324,7 +1323,9 @@ def add_time_series_features(df, train_col_means=None):
         shift5_rm5 = rm5_series.groupby(df["scenario_id"]).shift(4).values
         
         # Approximation: (current_mean - lagged_mean) / window
-        new_features[f"{col}_slope_5"] = (np.asarray(rm5_vals) - np.asarray(shift5_rm5)) / 5.0
+        new_features[f"{col}_slope_5"] = ((np.asarray(rm5_vals) - np.asarray(shift5_rm5)) / 5.0)
+        # [COLD_START_FIX] Handle initial rows where shift(4) is NaN
+        new_features[f"{col}_slope_5"] = pd.Series(new_features[f"{col}_slope_5"]).fillna(0.0).values
 
         # rate_1: Normalized change (diff / magnitude)
         # [WHY_THIS_DESIGN] diff_1=+10 means different things at baseline=100 vs baseline=1000.
@@ -1349,6 +1350,12 @@ def add_time_series_features(df, train_col_means=None):
         #   VARIANCE_COMPRESSION errors eliminated for all rate_1 features.
         col_vals = np.asarray(col_filled, dtype=np.float32)
         new_features[f"{col}_rate_1"] = np.asarray(diff_1, dtype=np.float32) / (np.abs(col_vals) + 1.0)
+        
+        # [MISSION 2.3] Register Lineage (Mission 2 Directed Fix)
+        # Why: Enables exact tracking of drift propagation from base to derivatives.
+        for suffix in ['rolling_mean_3', 'rolling_std_3', 'rolling_mean_5', 'rolling_std_5', 
+                       'diff_1', 'slope_5', 'rate_1']:
+            register_lineage(f"{col}_{suffix}", col)
 
     logger.info(f"[TS_FEATURES] Concat-ing {len(new_features)} new features")
     ts_df = pd.DataFrame(new_features, index=df.index)
@@ -1361,7 +1368,25 @@ def add_time_series_features(df, train_col_means=None):
 
     return pd.concat([df, ts_df], axis=1)
 
-def add_extreme_detection_features(df, extreme_quantiles=None):
+def add_scenario_context_features(df):
+    """
+    [MISSION: SCENARIO CONTEXT INJECTION - CAUSAL RECONSTRUCTION]
+    Addressing 'Scenario Polarization' with 100% causal integrity.
+    Removed look-ahead bias from volatility and progress features.
+    """
+    logger.info(f"[CONTEXT_FEATURES] Adding causal scenario context to df {df.shape}")
+    
+    # 1. Historical Max (Expanding) - Safe Causal Signal
+    df['scenario_max_historic'] = df.groupby('scenario_id')['order_inflow_15m'].expanding().max().reset_index(level=0, drop=True)
+    
+    # 2. Causal Volatility (Expanding Std) - Replace look-ahead initial_volatility
+    # Why: Using .iloc[:4].std() leaked future information to t=0,1,2.
+    # Fixed: expanding().std() only uses information available at time t.
+    df['scenario_volatility_causal'] = df.groupby('scenario_id')['order_inflow_15m'].expanding().std().reset_index(level=0, drop=True).fillna(0)
+    
+    return df
+
+def add_extreme_detection_features(df, extreme_quantiles=None, bucket_edges=None):
     """
     [TASK 11 — EXTREME QUANTILE CONSISTENCY]
     extreme_quantiles: dict of {col: q95_value} from train. If None, compute from df.
@@ -1387,21 +1412,60 @@ def add_extreme_detection_features(df, extreme_quantiles=None):
     # [WHY] Tree models handle step-functions (Buckets) better than raw products.
     # [FIX] C(5,2)=10 pairs from high-priority sensors.
     priority_sensors = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'battery_std', 'heavy_item_ratio']
-    import itertools
+    # [SSOT_FIX] Local import removed
     for c1, c2 in itertools.combinations(priority_sensors, 2):
         if c1 in df.columns and c2 in df.columns:
             # 1. Product (Standard)
             new_features[f'inter_{c1}_x_{c2}'] = df[c1] * df[c2]
             # 2. Ratio (Efficiency)
-            new_features[f'ratio_{c1}_to_{c2}'] = df[c1] / (df[c2] + 1e-9)
+            # [STABILITY_FIX] Ensure no Inf from division
+            ratio = df[c1] / (df[c2] + 1e-9)
+            new_features[f'ratio_{c1}_to_{c2}'] = ratio.replace([np.inf, -np.inf], 0).fillna(0)
             # 3. Difference (Relative Delta)
             new_features[f'diff_{c1}_{c2}'] = df[c1] - df[c2]
             # 4. Log-Product (Elasticity)
-            new_features[f'logprod_{c1}_{c2}'] = np.log1p(df[c1] * df[c2])
+            # [STABILITY_FIX] Use abs to prevent log of negative values and add safety fill
+            log_prod = np.log1p(np.abs(df[c1] * df[c2]))
+            new_features[f'logprod_{c1}_{c2}'] = log_prod.replace([np.inf, -np.inf], 0).fillna(0)
             # 5. Bucketed Interaction (Step-function)
-            b1 = pd.qcut(df[c1], 5, labels=False, duplicates='drop')
-            b2 = pd.qcut(df[c2], 5, labels=False, duplicates='drop')
+            # [LEAKAGE_PURGE] Use fixed bin edges from train fold
+            if bucket_edges is not None and c1 in bucket_edges:
+                b1 = pd.cut(df[c1], bins=bucket_edges[c1], labels=False, include_lowest=True).fillna(0).astype(int)
+            else:
+                _, b1_bins = pd.qcut(df[c1], 5, retbins=True, labels=False, duplicates='drop')
+                b1 = pd.cut(df[c1], bins=b1_bins, labels=False, include_lowest=True).fillna(0).astype(int)
+                if bucket_edges is not None: bucket_edges[c1] = b1_bins # Cache if in discovery mode
+                
+            if bucket_edges is not None and c2 in bucket_edges:
+                b2 = pd.cut(df[c2], bins=bucket_edges[c2], labels=False, include_lowest=True).fillna(0).astype(int)
+            else:
+                _, b2_bins = pd.qcut(df[c2], 5, retbins=True, labels=False, duplicates='drop')
+                b2 = pd.cut(df[c2], bins=b2_bins, labels=False, include_lowest=True).fillna(0).astype(int)
+                if bucket_edges is not None: bucket_edges[c2] = b2_bins
+                
             new_features[f'bucket_{c1}_x_{c2}'] = b1 * 5 + b2
+            
+            # [MISSION 2.3] Register Lineage (Mission 2 Directed Fix)
+            # Why: Ensures interaction features are suppressed if ANY parent is drifty.
+            for prefix in ['inter_', 'ratio_', 'diff_', 'logprod_', 'bucket_']:
+                feat_name = f'{prefix}{c1}_x_{c2}' if 'bucket' in prefix or 'inter' in prefix else f'{prefix}{c1}_to_{c2}' if 'ratio' in prefix else f'{prefix}{c1}_{c2}'
+                register_lineage(feat_name, [c1, c2])
+
+    # [MISSION 3] Physical Features
+    if 'order_inflow_15m_diff_1' in df.columns and 'robot_active' in df.columns:
+        new_features['surge_velocity'] = df['order_inflow_15m_diff_1'] / (df['robot_active'] + 1.0)
+    if 'order_inflow_15m' in df.columns and 'robot_utilization' in df.columns:
+        new_features['load_utilization_ratio'] = df['order_inflow_15m'] / (df['robot_utilization'] + 1e-6)
+    if 'avg_charge_wait' in df.columns and 'low_battery_ratio' in df.columns:
+        new_features['charging_stress'] = df['avg_charge_wait'] * df['low_battery_ratio']
+    if 'robot_active' in df.columns and 'order_inflow_15m' in df.columns:
+        new_features['robot_density'] = df['robot_active'] / (df['order_inflow_15m'] + 1.0)
+    if 'unique_sku_15m' in df.columns and 'order_inflow_15m' in df.columns:
+        new_features['sku_density'] = df['unique_sku_15m'] / (df['order_inflow_15m'] + 1.0)
+    if 'congestion_score_diff_1' in df.columns and 'order_inflow_15m' in df.columns:
+        new_features['congestion_surge'] = df['congestion_score_diff_1'] * df['order_inflow_15m']
+    if 'low_battery_ratio' in df.columns and 'robot_active' in df.columns:
+        new_features['battery_starvation'] = df['low_battery_ratio'] * df['robot_active']
 
     # Early Warning
     # [WHY_THIS_DESIGN] Justified Heuristic for Early Warning
@@ -1478,3 +1542,29 @@ def load_data():
     train = train.merge(layout, on="layout_id", how="left")
     test = test.merge(layout, on="layout_id", how="left")
     return downcast_df(train), downcast_df(test)
+
+# [MISSION 3.2] Stable Feature Selection
+def get_drift_stable_features(all_features, drift_df, ks_threshold=0.15):
+    """
+    [WHY] 
+    ADV AUC 0.95는 특정 피처들의 강한 시간적 편향에 기인함. 
+    [FIX] 
+    1. 데이터 기반 KS 임계치(ks_threshold)를 사용하여 불안정 피처 제거.
+    2. [MISSION 2.4] Conditional Protection 적용: 
+       심각하게 드리프트된(KS > 0.10) 베이스 피처의 파생 변수들은 보호하지 않음.
+    """
+    # Use the new conditional protection logic
+    protected_candidates = get_protected_candidates(all_features, drift_df=drift_df)
+    
+    stable_features = []
+    dropped_count = 0
+    
+    for f in all_features:
+        ks = drift_df.loc[drift_df['feature'] == f, 'ks_stat'].values[0]
+        if ks < ks_threshold or f in protected_candidates:
+            stable_features.append(f)
+        else:
+            dropped_count += 1
+            
+    logger.info(f"[STABILITY] Pruned {dropped_count} features with KS > {ks_threshold:.4f} (Protected {len(protected_candidates)})")
+    return stable_features

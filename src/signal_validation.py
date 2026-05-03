@@ -3,9 +3,14 @@ import numpy as np
 import pandas as pd
 from lightgbm import LGBMRegressor
 from sklearn.metrics import mean_absolute_error
-from sklearn.model_selection import train_test_split
 import json
 import os
+import gc
+from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
+from scipy.stats import pearsonr
+from .utils import downcast_df
+from lightgbm import LGBMClassifier
+from sklearn.metrics import roc_auc_score
 
 logger = logging.getLogger(__name__)
 
@@ -17,6 +22,9 @@ class SignalValidator:
     """
     def __init__(self, config_params, stability_df, relaxation_config=None):
         self.params = config_params.copy()
+        # [MEMORY_OPTIMIZATION] Use lighter models for signal validation
+        self.params['n_estimators'] = 200
+        self.params['n_jobs'] = 4
         if 'random_state' not in self.params:
             self.params['random_state'] = 42
         self.stability_df = stability_df.set_index('feature')
@@ -47,24 +55,26 @@ class SignalValidator:
     def evaluate(self, X_train, y_train, candidates, buckets, base_cols):
         logger.info(f"[SIGNAL_VALIDATOR] Evaluating {len(candidates)} candidates with Noise Immunity Architecture...")
         
-        # [TASK 6] Noise Injection for Proof
-        n_noise = 20
+        # [MEMORY_OPTIMIZATION] Use float32 and avoid full copies
+        X_train = downcast_df(X_train.copy())
+        
+        # [SPEED_OPTIMIZATION] Reduced noise injection for faster validation
+        n_noise = 10
         noise_cols = [f'__noise_{i}__' for i in range(n_noise)]
-        X_with_noise = X_train.copy()
         for c in noise_cols:
-            X_with_noise[c] = np.random.normal(0, 1, len(X_train))
+            X_train[c] = np.random.normal(0, 1, len(X_train)).astype(np.float32)
+        X_with_noise = X_train
         
         # 1. Train evaluator model
         X_tr, X_val, y_tr, y_val = train_test_split(X_with_noise, y_train, test_size=0.2, random_state=42)
+        gc.collect()
         model = LGBMRegressor(**self.params)
         model.fit(X_tr, y_tr)
         
         # [NEW] 3-Fold CV for Cross-fold Consistency & Sign Stability
-        from sklearn.model_selection import KFold
-        from scipy.stats import pearsonr
-        
         cv_stats = {f: {'gains': [], 'signs': []} for f in candidates}
-        kf = KFold(n_splits=3, shuffle=True, random_state=42)
+        # [SPEED_OPTIMIZATION] 2-Fold instead of 3-Fold for internal consistency check
+        kf = KFold(n_splits=2, shuffle=True, random_state=42)
         
         logger.info("[SIGNAL_VALIDATOR] Running 3-Fold CV for Consistency...")
         y_train_arr = y_train.values if isinstance(y_train, pd.Series) else y_train
@@ -81,10 +91,15 @@ class SignalValidator:
                 if f not in X_with_noise.columns: continue
                 cv_stats[f]['gains'].append(cv_imp.get(f, 0))
                 try:
-                    corr, _ = pearsonr(cv_val_x[f].values, cv_val_y)
+                    # [MEMORY_OPTIMIZATION] Avoid unnecessary object creation
+                    vals = cv_val_x[f].values
+                    corr, _ = pearsonr(vals, cv_val_y)
                     cv_stats[f]['signs'].append(np.sign(corr) if not np.isnan(corr) else 0)
                 except:
                     cv_stats[f]['signs'].append(0)
+            
+            del cv_model, cv_tr_x, cv_val_x
+            gc.collect()
                     
         # Compute consistency scores
         self.consistency_scores = {}
@@ -92,7 +107,7 @@ class SignalValidator:
             gains = cv_stats[f]['gains']
             signs = cv_stats[f]['signs']
             gain_cv = np.std(gains) / (np.mean(gains) + 1e-9) if np.mean(gains) > 0 else 1.0
-            sign_stability = abs(np.sum(signs)) / 3.0 # 1.0 if all same sign
+            sign_stability = abs(np.sum(signs)) / 2.0 # 1.0 if all same sign
             
             # stability_factor ranges from ~0 to 1
             self.consistency_scores[f] = {
@@ -118,7 +133,12 @@ class SignalValidator:
         
         # 3. Permutation Analysis
         base_pred = model.predict(X_val)
-        base_mae = mean_absolute_error(y_val, base_pred)
+        # [OOF_GAP_FIX] NaN-safe metric evaluation
+        mask_base = ~np.isnan(base_pred)
+        if mask_base.any():
+            base_mae = mean_absolute_error(y_val[mask_base], base_pred[mask_base])
+        else:
+            base_mae = 1e9 # Penalty for no predictions
         
         # [TASK 2] Group/Conditional Permutation
         # For simplicity in this env, we group by base_col or correlation
@@ -127,26 +147,53 @@ class SignalValidator:
         # Pre-calculate correlation for redundancy check
         corr_matrix = X_tr[candidates].corr()
         
-        # [TASK 6] Expanded Permutation Analysis (including noise for baseline)
-        logger.info("[SIGNAL_VALIDATOR] Running Permutation Attack (including Noise Baseline)...")
+        # [SPEED_OPTIMIZATION] Sample 20% for permutation attack using positional indexing
+        val_size = len(y_val)
+        sample_indices = np.random.RandomState(42).choice(val_size, int(val_size * 0.2), replace=False)
+        X_val_sample = X_val.iloc[sample_indices]
+        y_val_sample = y_val[sample_indices]
+        
+        base_pred_sample = model.predict(X_val_sample)
+        # [OOF_GAP_FIX] NaN-safe sample MAE
+        mask_sample = ~np.isnan(base_pred_sample)
+        if mask_sample.any():
+            base_mae_sample = mean_absolute_error(y_val_sample[mask_sample], base_pred_sample[mask_sample])
+        else:
+            base_mae_sample = 1e9
+        
         eval_pool = list(candidates) + noise_cols
         
         for feat in eval_pool:
             if feat not in X_val.columns: continue
             
-            # Simple Permutation
-            X_tmp = X_val.copy()
-            X_tmp[feat] = np.random.permutation(X_tmp[feat].values)
-            delta = mean_absolute_error(y_val, model.predict(X_tmp)) - base_mae
+            # [MEMORY_OPTIMIZATION] In-place permutation to avoid N_FEAT copies of X_val
+            orig_vals = X_val_sample[feat].copy()
+            X_val_sample[feat] = np.random.permutation(orig_vals.values)
+            p_pred = model.predict(X_val_sample)
+            mask_p = ~np.isnan(p_pred)
+            if mask_p.any():
+                delta = mean_absolute_error(y_val_sample[mask_p], p_pred[mask_p]) - base_mae_sample
+            else:
+                delta = 0.0
+            X_val_sample[feat] = orig_vals # Restore
             
             # Group Permutation (only for real candidates)
             if feat in candidates:
                 cluster_members = [c for c in candidates if c != feat and corr_matrix.loc[feat, c] > 0.95]
                 if cluster_members:
-                    X_group = X_val.copy()
+                    # In-place for group as well
+                    saved_group = {m: X_val[m].copy() for m in [feat] + cluster_members}
                     for m in [feat] + cluster_members:
-                        X_group[m] = np.random.permutation(X_group[m].values)
-                    group_delta = mean_absolute_error(y_val, model.predict(X_group)) - base_mae
+                         X_val[m] = np.random.permutation(X_val[m].values)
+                    g_pred = model.predict(X_val)
+                    mask_g = ~np.isnan(g_pred)
+                    if mask_g.any():
+                        group_delta = mean_absolute_error(y_val[mask_g], g_pred[mask_g]) - base_mae
+                    else:
+                        group_delta = 0.0
+                    # Restore group
+                    for m, vals in saved_group.items():
+                         X_val[m] = vals
                 else:
                     group_delta = delta
             else:
@@ -157,6 +204,10 @@ class SignalValidator:
                 'group_delta': group_delta,
                 'gen_ratio': delta / (gain_imp.get(feat, 0) + 1e-9)
             }
+        
+        # Explicitly free memory after heavy permutation analysis
+        del X_tr, X_val, X_val_sample
+        gc.collect()
 
         # 4. Filter & Score
         # [CRITICAL REDESIGN] 3-Gate System replacing the old 7-gate system.
@@ -172,7 +223,14 @@ class SignalValidator:
         noise_perm_deltas = [perm_imp[c]['delta'] for c in noise_cols if c in perm_imp]
         max_noise_perm = max(noise_perm_deltas) if noise_perm_deltas else 0
         
+        # [MISSION 3] Data-Driven Stability Ceiling
+        # Compute dynamic KS floor from current distribution to replace hardcoded 0.50
+        ks_values = self.stability_df['ks_stat'].dropna().values
+        # Use P90 of KS as the stability ceiling, but cap it at 0.25 for safety
+        dynamic_ks_ceiling = float(np.clip(np.percentile(ks_values, 90), 0.10, 0.25))
+        
         logger.info(f"[SIGNAL_VALIDATOR] Noise Ceiling: Max Gain={max_noise_gain:.4f}, Max Perm={max_noise_perm:.6f}")
+        logger.info(f"[SIGNAL_VALIDATOR] Dynamic Stability Ceiling: {dynamic_ks_ceiling:.4f}")
         
         passed_features = []
         for feat in candidates:
@@ -227,10 +285,10 @@ class SignalValidator:
             gate_signal = is_significant and (is_stable or is_strong_truth)
             
             # GATE 3: STABILITY GATE — Drift Balance.
-            # [ROLLBACK] 0.35 was too aggressive — killed real signals, worsened ADV AUC.
-            # [RESTORED] 0.50 balances drift control with signal preservation.
-            # [LESSON] Extreme KS pruning doesn't fix generalization; it destroys it.
-            gate_stability = ks <= 0.50
+            # [MISSION 3] Use dynamic ceiling instead of hardcoded 0.50
+            # [WHY] KS <= 0.50은 너무 관대하여 리더보드 일반화 성능을 저해함.
+            # [FIX] 데이터 분포의 P90 수준(최대 0.25)으로 강화하여 이상치 수준의 drift feature 차단.
+            gate_stability = ks <= dynamic_ks_ceiling
 
             # GATE 4: INTERACTION GATE — Noise Guard.
             # [RECALIBRATION] Simple noise check is sufficient for interactions.
@@ -280,8 +338,14 @@ class SignalValidator:
             df_ranks = pd.DataFrame({'f': survivors_after_redundancy})
             df_ranks['gain_rank'] = df_ranks['f'].map(gain_imp).rank(pct=True)
             df_ranks['perm_rank'] = df_ranks['f'].apply(lambda x: perm_imp[x]['delta']).rank(pct=True)
-            df_ranks['stab_rank'] = df_ranks['f'].apply(lambda x: -self.stability_df.loc[x, 'ks_stat'] if x in self.stability_df.index else 0).rank(pct=True)
-            df_ranks['score'] = df_ranks['gain_rank'] + df_ranks['perm_rank'] + df_ranks['stab_rank']
+            
+            # [MISSION 3.3] Generalization Penalty
+            # [WHY] KS drift indicates features that might work well in train but fail in test (ADV AUC 0.95).
+            # [FIX] Increase the weight of stability rank (3x) in the final score.
+            #   Negative KS means lower KS is better (higher rank).
+            df_ranks['stab_rank'] = df_ranks['f'].apply(lambda x: -self.stability_df.loc[x, 'ks_stat'] if x in self.stability_df.index else -1.0).rank(pct=True)
+            df_ranks['score'] = df_ranks['gain_rank'] + df_ranks['perm_rank'] + (3.0 * df_ranks['stab_rank'])
+            
             final_protected = set(survivors_after_redundancy)
             
         # [TASK 2 & 4] Signal Bucket Selection
@@ -313,4 +377,93 @@ class SignalValidator:
         logger.info(f"[PROOF] Noise Survival Rate: {self.noise_metrics['noise_survival_rate']:.2%}")
         logger.info(f"[PROOF] Noise Avg Splits: {self.noise_metrics['noise_avg_splits']:.2f}")
 
+        del corr_matrix
+        gc.collect()
+
         return final_protected, bucket_survivors, self.validation_logs, self.noise_metrics
+
+class CollectiveDriftPruner:
+    """
+    [MISSION 3 — COLLECTIVE DRIFT SUPPRESSION]
+    
+    [WHY SINGLE FEATURE FILTERING FAILED]
+    Forensic proof showed that even if each feature has KS < 0.05, the combination 
+    of 200+ such features creates ADV AUC 0.95. This 'Collective Drift' acts 
+    as a high-dimensional discriminant that separates Train from Test.
+    
+    [FIX: Iterative Pruning]
+    1. Train a full adversarial classifier on the remaining feature set.
+    2. Rank features by Adversarial Importance (drift contribution).
+    3. Remove the top-N contributors.
+    4. Repeat until ADV AUC < Target (0.75).
+    """
+    def __init__(self, target_auc=0.75, max_iterations=10, prune_step=5):
+        self.target_auc = target_auc
+        self.max_iterations = max_iterations
+        self.prune_step = prune_step
+        self.pruning_history = []
+
+    def prune(self, train_df, test_df, initial_features, protected_cols=None):
+        # [SSOT_FIX] Local imports removed
+        
+        current_features = list(initial_features)
+        protected_cols = set(protected_cols or [])
+        
+        logger.info(f"[COLLECTIVE_DRIFT] Starting iterative pruning. Target AUC: {self.target_auc}")
+        
+        for i in range(self.max_iterations):
+            # Prepare data
+            n_tr = min(5000, len(train_df))
+            n_te = min(5000, len(test_df))
+            
+            X_tr = train_df[current_features].sample(n_tr, random_state=42 + i).fillna(-999)
+            X_te = test_df[current_features].sample(n_te, random_state=42 + i).fillna(-999)
+            
+            X = pd.concat([X_tr, X_te], axis=0)
+            y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))])
+            
+            # Evaluate current AUC via 3-fold CV
+            skf = StratifiedKFold(n_splits=3, shuffle=True, random_state=42)
+            fold_aucs = []
+            importances = np.zeros(len(current_features))
+            
+            for tr_idx, val_idx in skf.split(X, y):
+                X_f_tr, X_f_val = X.iloc[tr_idx], X.iloc[val_idx]
+                y_f_tr, y_f_val = y[tr_idx], y[val_idx]
+                
+                clf = LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, 
+                                     random_state=42, verbose=-1, n_jobs=4)
+                clf.fit(X_f_tr, y_f_tr)
+                
+                preds = clf.predict_proba(X_f_val)[:, 1]
+                fold_aucs.append(roc_auc_score(y_f_val, preds))
+                importances += clf.feature_importances_ / 3.0
+                
+            avg_auc = np.mean(fold_aucs)
+            logger.info(f"[COLLECTIVE_DRIFT] Iter {i}: AUC={avg_auc:.4f} | Features={len(current_features)}")
+            
+            self.pruning_history.append({
+                'iteration': i,
+                'auc': avg_auc,
+                'n_features': len(current_features)
+            })
+            
+            if avg_auc <= self.target_auc:
+                logger.info(f"[COLLECTIVE_DRIFT] Target AUC reached at iteration {i}.")
+                break
+                
+            # [MISSION 3: TOTAL AUDIT] No feature is immune to drift pruning.
+            # Why: Protecting raw features led to 0.98 AUC paralysis.
+            # to_prune candidates are selected from ALL current_features.
+            imp_df = pd.DataFrame({'feature': current_features, 'importance': importances})
+            
+            if imp_df.empty:
+                logger.warning("[COLLECTIVE_DRIFT] No more features. Stopping.")
+                break
+                
+            to_prune = imp_df.sort_values('importance', ascending=False).head(self.prune_step)['feature'].tolist()
+            
+            logger.info(f"[COLLECTIVE_DRIFT] Pruning top {len(to_prune)} contributors: {to_prune[:3]}...")
+            current_features = [f for f in current_features if f not in to_prune]
+            
+        return current_features, self.pruning_history

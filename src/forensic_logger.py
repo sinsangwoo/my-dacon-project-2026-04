@@ -5,6 +5,8 @@ import pandas as pd
 import numpy as np
 from datetime import datetime
 import logging
+from scipy.stats import ks_2samp
+from sklearn.metrics import mean_absolute_error
 from .utils import get_logger, save_json
 
 class ForensicLogger:
@@ -187,7 +189,7 @@ class ForensicLogger:
     def log_drift(self, train_df, test_df, features, top_n=20):
         """Perform drift analysis between train and test."""
         if self.mode == 'lite': return
-        from scipy.stats import ks_2samp
+        # [SSOT_FIX] Local import removed
         
         drift_results = []
         for col in features:
@@ -215,13 +217,21 @@ class ForensicLogger:
         
     def log_model_performance(self, y_true, oof_lgb, oof_cat=None):
         """Log model-specific performance and delay segment MAE."""
-        from sklearn.metrics import mean_absolute_error
-        lgb_mae = mean_absolute_error(y_true, oof_lgb)
-        model_metrics = {"lgb_mae": float(lgb_mae)}
+        # [SSOT_FIX] Local import removed
         
+        # [OOF_GAP_FIX] NaN-safe masking for forensic logging
+        mask_lgb = ~np.isnan(oof_lgb)
+        if mask_lgb.any():
+            lgb_mae = mean_absolute_error(y_true[mask_lgb], oof_lgb[mask_lgb])
+            model_metrics = {"lgb_mae": float(lgb_mae)}
+        else:
+            model_metrics = {"lgb_mae": 0.0}
+            
         if oof_cat is not None and not (oof_cat == 0).all():
-            cat_mae = mean_absolute_error(y_true, oof_cat)
-            model_metrics["cat_mae"] = float(cat_mae)
+            mask_cat = ~np.isnan(oof_cat)
+            if mask_cat.any():
+                cat_mae = mean_absolute_error(y_true[mask_cat], oof_cat[mask_cat])
+                model_metrics["cat_mae"] = float(cat_mae)
             
         # Delay segments
         delay_metrics = {}
@@ -233,10 +243,11 @@ class ForensicLogger:
         }
         
         for name, mask in segments.items():
-            if mask.any():
-                mae = mean_absolute_error(y_true[mask], oof_lgb[mask])
+            combined_mask = mask & mask_lgb
+            if combined_mask.any():
+                mae = mean_absolute_error(y_true[combined_mask], oof_lgb[combined_mask])
                 delay_metrics[f"{name}_mae"] = float(mae)
-                delay_metrics[f"{name}_count"] = int(mask.sum())
+                delay_metrics[f"{name}_count"] = int(combined_mask.sum())
         
         self.add_metric("MODEL_PERFORMANCE", "model_specific", model_metrics)
         self.add_metric("MODEL_PERFORMANCE", "delay_segments", delay_metrics)

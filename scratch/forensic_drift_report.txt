@@ -1,0 +1,100 @@
+ADV AUC on sample: 0.9607
+
+TOP 30 ADVERSARIAL IMPORTANCE
+                                    feature  ks_stat       p_value  is_drifted  importance  is_protected
+                           order_inflow_15m 0.197570  0.000000e+00        True         153          True
+bucket_order_inflow_15m_x_robot_utilization 0.023040  1.202934e-19       False          93          True
+                          robot_utilization 0.078184 5.609251e-222        True          39          True
+            order_inflow_15m_rolling_mean_5 0.216665  0.000000e+00        True          39          True
+bucket_robot_utilization_x_congestion_score 0.016504  2.740276e-10       False          32          True
+           sku_concentration_rolling_mean_3 0.102863  0.000000e+00        True          23          True
+                                 is_extreme 0.000684  1.000000e+00       False          17         False
+    diff_order_inflow_15m_robot_utilization 0.198085  0.000000e+00        True          17          True
+                                battery_std 0.042873  3.648682e-59       False          16          True
+                               robot_active 0.108936  0.000000e+00        True          15          True
+          urgent_order_ratio_rolling_mean_5 0.088372 4.190828e-282        True          15          True
+           sku_concentration_rolling_mean_5 0.103023  0.000000e+00        True          14          True
+                           is_extreme_multi 0.011352  4.302414e-05       False          14         False
+                         near_collision_15m 0.055930 2.052249e-100        True          11          True
+                           congestion_score 0.081355 6.465768e-210        True          11          True
+                  robot_idle_rolling_mean_3 0.085656 2.031152e-266        True          11          True
+                  robot_idle_rolling_mean_5 0.082956 6.871708e-250        True          11          True
+                                 robot_idle 0.086280 2.581283e-270        True          11          True
+ bucket_congestion_score_x_heavy_item_ratio 0.010348  2.645678e-04       False           9          True
+      bucket_order_inflow_15m_x_battery_std 0.011876  1.559669e-05       False           9          True
+     bucket_robot_utilization_x_battery_std 0.022872  2.288270e-19       False           8          True
+             order_inflow_15m_rolling_std_5 0.171849  0.000000e+00        True           7          True
+ bucket_order_inflow_15m_x_heavy_item_ratio 0.022732  3.896429e-19       False           7          True
+      bucket_congestion_score_x_battery_std 0.012292  6.745671e-06       False           7          True
+     diff_order_inflow_15m_heavy_item_ratio 0.196716  0.000000e+00        True           7          True
+ bucket_order_inflow_15m_x_congestion_score 0.013176  1.032547e-06       False           6          True
+     diff_order_inflow_15m_congestion_score 0.191604  0.000000e+00        True           6          True
+                robot_active_rolling_mean_5 0.125960  0.000000e+00        True           5          True
+             air_quality_idx_rolling_mean_3 0.011976  1.390529e-05       False           4          True
+                             robot_charging 0.077200 1.984639e-216        True           4          True
+
+TOP 30 KS STAT
+                                    feature  ks_stat       p_value  is_drifted  importance  is_protected
+            order_inflow_15m_rolling_mean_5 0.216665  0.000000e+00        True          39          True
+            order_inflow_15m_rolling_mean_3 0.209660  0.000000e+00        True           4          True
+    diff_order_inflow_15m_robot_utilization 0.198085  0.000000e+00        True          17          True
+                           order_inflow_15m 0.197570  0.000000e+00        True         153          True
+          diff_order_inflow_15m_battery_std 0.196732  0.000000e+00        True           0          True
+     diff_order_inflow_15m_heavy_item_ratio 0.196716  0.000000e+00        True           7          True
+     diff_order_inflow_15m_congestion_score 0.191604  0.000000e+00        True           6          True
+       logprod_order_inflow_15m_battery_std 0.190473  0.000000e+00        True           0          True
+       inter_order_inflow_15m_x_battery_std 0.190473  0.000000e+00        True           1          True
+      ratio_order_inflow_15m_to_battery_std 0.186815  0.000000e+00        True           0          True
+             order_inflow_15m_rolling_std_5 0.171849  0.000000e+00        True           7          True
+ratio_order_inflow_15m_to_robot_utilization 0.154700  0.000000e+00        True           0          True
+  logprod_order_inflow_15m_heavy_item_ratio 0.148544  0.000000e+00        True           0          True
+  inter_order_inflow_15m_x_heavy_item_ratio 0.148544  0.000000e+00        True           0          True
+             order_inflow_15m_rolling_std_3 0.143181  0.000000e+00        True           0          True
+ inter_order_inflow_15m_x_robot_utilization 0.139440  0.000000e+00        True           0          True
+ logprod_order_inflow_15m_robot_utilization 0.139440  0.000000e+00        True           0          True
+                robot_active_rolling_mean_5 0.125960  0.000000e+00        True           5          True
+ ratio_order_inflow_15m_to_heavy_item_ratio 0.121829  0.000000e+00        True           0          True
+                robot_active_rolling_mean_3 0.119348  0.000000e+00        True           0          True
+              unique_sku_15m_rolling_mean_5 0.115399  0.000000e+00        True           1          True
+              unique_sku_15m_rolling_mean_3 0.114513  0.000000e+00        True           3          True
+             heavy_item_ratio_rolling_std_5 0.111938  0.000000e+00        True           0          True
+                             unique_sku_15m 0.111102  0.000000e+00        True           0          True
+                               robot_active 0.108936  0.000000e+00        True          15          True
+                          sku_concentration 0.103564  0.000000e+00        True           0          True
+           sku_concentration_rolling_mean_5 0.103023  0.000000e+00        True          14          True
+           sku_concentration_rolling_mean_3 0.102863  0.000000e+00        True          23          True
+                 robot_active_rolling_std_5 0.100258  0.000000e+00        True           3          True
+  inter_order_inflow_15m_x_congestion_score 0.097625 1.570793e-266        True           0          True
+
+TOP 30 PROTECTED DRIFT
+                                    feature  ks_stat       p_value  is_drifted  importance  is_protected
+            order_inflow_15m_rolling_mean_5 0.216665  0.000000e+00        True          39          True
+            order_inflow_15m_rolling_mean_3 0.209660  0.000000e+00        True           4          True
+    diff_order_inflow_15m_robot_utilization 0.198085  0.000000e+00        True          17          True
+                           order_inflow_15m 0.197570  0.000000e+00        True         153          True
+          diff_order_inflow_15m_battery_std 0.196732  0.000000e+00        True           0          True
+     diff_order_inflow_15m_heavy_item_ratio 0.196716  0.000000e+00        True           7          True
+     diff_order_inflow_15m_congestion_score 0.191604  0.000000e+00        True           6          True
+       inter_order_inflow_15m_x_battery_std 0.190473  0.000000e+00        True           1          True
+       logprod_order_inflow_15m_battery_std 0.190473  0.000000e+00        True           0          True
+      ratio_order_inflow_15m_to_battery_std 0.186815  0.000000e+00        True           0          True
+             order_inflow_15m_rolling_std_5 0.171849  0.000000e+00        True           7          True
+ratio_order_inflow_15m_to_robot_utilization 0.154700  0.000000e+00        True           0          True
+  inter_order_inflow_15m_x_heavy_item_ratio 0.148544  0.000000e+00        True           0          True
+  logprod_order_inflow_15m_heavy_item_ratio 0.148544  0.000000e+00        True           0          True
+             order_inflow_15m_rolling_std_3 0.143181  0.000000e+00        True           0          True
+ inter_order_inflow_15m_x_robot_utilization 0.139440  0.000000e+00        True           0          True
+ logprod_order_inflow_15m_robot_utilization 0.139440  0.000000e+00        True           0          True
+                robot_active_rolling_mean_5 0.125960  0.000000e+00        True           5          True
+ ratio_order_inflow_15m_to_heavy_item_ratio 0.121829  0.000000e+00        True           0          True
+                robot_active_rolling_mean_3 0.119348  0.000000e+00        True           0          True
+              unique_sku_15m_rolling_mean_5 0.115399  0.000000e+00        True           1          True
+              unique_sku_15m_rolling_mean_3 0.114513  0.000000e+00        True           3          True
+             heavy_item_ratio_rolling_std_5 0.111938  0.000000e+00        True           0          True
+                             unique_sku_15m 0.111102  0.000000e+00        True           0          True
+                               robot_active 0.108936  0.000000e+00        True          15          True
+                          sku_concentration 0.103564  0.000000e+00        True           0          True
+           sku_concentration_rolling_mean_5 0.103023  0.000000e+00        True          14          True
+           sku_concentration_rolling_mean_3 0.102863  0.000000e+00        True          23          True
+                 robot_active_rolling_std_5 0.100258  0.000000e+00        True           3          True
+  inter_order_inflow_15m_x_congestion_score 0.097625 1.570793e-266        True           0          True

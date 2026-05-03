@@ -1,4 +1,5 @@
 import logging
+import itertools
 
 logger = logging.getLogger(__name__)
 
@@ -69,8 +70,7 @@ TS_SUFFIXES = [
     '_rolling_mean_5', '_rolling_std_5',   # Medium-window (75min) state & stability
     '_diff_1',                              # Absolute first-order change
     '_slope_5',                             # Linear trend direction over 5 steps
-    '_rate_1',                              # Normalized change (relative to magnitude)
-    '_is_boundary'                          # Scenario boundary indicator
+    '_rate_1'                               # Normalized change (relative to magnitude)
 ]
 
 EXTREME_SUFFIXES = [
@@ -91,7 +91,7 @@ def get_feature_schema():
     
     # [RAW]
     raw_features = list(BASE_COLS)
-    raw_features += ['timestep_index', 'normalized_time', 'cold_start_flag']
+    raw_features += ['timestep_index', 'normalized_time', 'cold_start_flag', 'is_scenario_boundary']
     
     for col in BASE_COLS:
         for s in TS_SUFFIXES:
@@ -103,7 +103,7 @@ def get_feature_schema():
     # [ROOT_CAUSE] Previous hardcoded logic (3 features) caused Interaction=0 survivors.
     # [SOLUTION] Iterate through top sensor pairs to explore the sensor interaction space.
     interaction_targets = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'battery_std', 'heavy_item_ratio']
-    import itertools
+    # [SSOT_FIX] Local import removed
     for f1, f2 in itertools.combinations(interaction_targets, 2):
         raw_features.append(f"inter_{f1}_x_{f2}")
         raw_features.append(f"ratio_{f1}_to_{f2}")
@@ -112,6 +112,13 @@ def get_feature_schema():
         raw_features.append(f"bucket_{f1}_x_{f2}")
         
     raw_features.extend(["early_warning_flag", "early_warning_score", "is_extreme", "is_extreme_multi"])
+    
+    # [MISSION 3] Physical Features
+    raw_features.extend(["surge_velocity", "load_utilization_ratio", "charging_stress", "robot_density", "sku_density", 
+                        "congestion_surge", "battery_starvation"])
+    
+    # [MISSION: SCENARIO CONTEXT - CAUSAL]
+    raw_features.extend(["scenario_max_historic", "scenario_volatility_causal"])
     
     # [LAYOUT_AGGREGATION] Task 2.3
     layout_target_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'avg_trip_distance', 'pack_utilization']

@@ -1,5 +1,7 @@
 
 import logging
+import os
+import sys
 import pandas as pd
 import numpy as np
 from src.schema import FEATURE_SCHEMA, BASE_COLS
@@ -164,6 +166,5 @@ def run_structural_audit(mode='real_data'):
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO)
-    import sys
     mode = 'real_data' if '--dummy' not in sys.argv else 'dummy'
     run_structural_audit(mode=mode)

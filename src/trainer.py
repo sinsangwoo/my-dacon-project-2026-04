@@ -4,7 +4,6 @@ import pandas as pd
 import os
 import gc
 import pickle
-import logging
 import re
 from lightgbm import LGBMRegressor, LGBMClassifier
 from sklearn.preprocessing import StandardScaler
@@ -12,17 +11,13 @@ from sklearn.metrics import roc_auc_score, mean_absolute_error
 from sklearn.model_selection import StratifiedKFold
 from .config import Config
 from .schema import FEATURE_SCHEMA
-from src.distribution import DomainShiftAudit, DistributionAuditor
+from src.distribution import DistributionAuditor
+from . import utils
 from .utils import (
     save_npy, load_npy, memory_guard, DriftShieldScaler, 
-    SAFE_FIT, SAFE_PREDICT, build_metrics, calculate_risk_score, 
+    build_metrics, calculate_risk_score, 
     save_json, calculate_std_ratio
 )
-import re
-from sklearn.preprocessing import StandardScaler
-from lightgbm import LGBMClassifier
-from sklearn.metrics import roc_auc_score, mean_absolute_error
-from sklearn.model_selection import StratifiedKFold
 from .data_loader import (
     apply_latent_features,
     SuperchargedPCAReconstructor,
@@ -33,20 +28,67 @@ from .data_loader import (
     add_scenario_context_features,
 )
 from .signal_validation import CollectiveDriftPruner, SignalValidator
-from .intelligence import ExperimentIntelligence
-# [CV_RELIABILITY] Import the new CV reliability reconstruction module.
-# [WHY] The existing CV pipeline shows near-zero correlation with LB (adv_auc 0.80-0.95,
-#   std_ratio 0.46-0.62). This module quantifies the measurement system failure and
-#   generates a reliability report after each training run.
-# [FAILURE_ADDRESSED] CV-LB mismatch caused by expanding window asymmetry and
-#   homogeneous validation domain (all folds from training distribution only).
 from .cv_reliability import CVPipelineAnalyzer, CVReliabilityQuantifier, generate_cv_reliability_report
-from sklearn.preprocessing import StandardScaler
-import re
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import StratifiedKFold
+from .intelligence import ExperimentIntelligence
 
 logger = logging.getLogger(__name__)
+
+def _sigmoid_gate(p, k, theta):
+    """Sigmoid-based blending gate to sharpen tail transition."""
+    return 1.0 / (1.0 + np.exp(-k * (p - theta)))
+
+def _multi_signal_blend(p, preds_t, preds_nt):
+    """
+    [ARCHITECTURAL RECONSTRUCTION: MULTI-SIGNAL GATING]
+    Relaxed to allow tail signal to pass when either classifier is highly confident
+    OR the regressors show a massive divergence with moderate confidence.
+    """
+    # Condition A: Classifier is highly confident
+    cond_a = p > 0.65
+    # Condition B: Regressors disagree massively AND classifier isn't totally dead
+    cond_b = (preds_t > (preds_nt * 2.0)) & (p > 0.4)
+    
+    # Base weight is less suppressive (Config.BLENDING_POWER = 1.5 instead of 2.0)
+    base_weight = p ** Config.BLENDING_POWER
+    
+    # Apply aggressive Sigmoid when EITHER condition is met
+    multi_signal_mask = cond_a | cond_b
+    
+    final_weight = base_weight.copy()
+    if np.any(multi_signal_mask):
+        final_weight[multi_signal_mask] = _sigmoid_gate(
+            p[multi_signal_mask], 
+            Config.SIGMOID_K, 
+            Config.SIGMOID_THETA
+        )
+    return final_weight
+
+class TailRiskController:
+    """Controls aggressive tail predictions when classifier confidence is low."""
+    def __init__(self, gap_threshold, clf_floor, damp_factor):
+        self.gap_threshold = gap_threshold
+        self.clf_floor = clf_floor
+        self.damp_factor = damp_factor
+
+    def compute_gap(self, preds_t, preds_nt):
+        """Measures divergence between tail and non-tail regressors."""
+        return np.abs(preds_t - preds_nt) / (preds_nt + 1e-6)
+
+    def apply(self, weight, p, gap):
+        """Applies damping to weight if tail prediction is risky."""
+        danger_mask = (gap > self.gap_threshold) & (p < self.clf_floor)
+        
+        # If in danger, damp the weight proportional to distrust
+        # danger_intensity: how much gap exceeds threshold (maxed at 2x threshold)
+        danger_intensity = np.clip((gap - self.gap_threshold) / self.gap_threshold, 0, 2)
+        # p_distrust: how much p is below floor
+        p_distrust = np.clip((self.clf_floor - p) / self.clf_floor, 0, 1)
+        
+        # damping range: [damp_factor, 1.0]
+        damping = 1.0 - (danger_intensity * p_distrust * (1.0 - self.damp_factor))
+        damping = np.clip(damping, self.damp_factor, 1.0)
+        
+        return weight * damping
 
 # Base columns that must be present in every fold (raw features)
 BASE_COLS = FEATURE_SCHEMA["raw_features"]
@@ -54,10 +96,12 @@ BASE_COLS = FEATURE_SCHEMA["raw_features"]
 
 class Trainer:
     def __init__(self, df_train, y, df_test, groups=None, full_df=None, test_df=None, drift_df=None, ks_threshold=None, manifest=None):
-        self.df_train = full_df if full_df is not None else df_train
+        self.df_train = df_train if df_train is not None else full_df
         self.y = y
-        self.df_test = test_df if test_df is not None else df_test
+        self.df_test = df_test if df_test is not None else test_df
         self.groups = groups
+        self.full_df = self.df_train
+        self.test_df = self.df_test
         self.drift_df = drift_df
         self.ks_threshold = ks_threshold
         self.manifest = manifest # [v7.0] Stability manifest for inference fallback
@@ -171,13 +215,12 @@ class Trainer:
             X_val = train_df_scaled.iloc[val_idx][raw_cols].values.astype(np.float32)
             y_val = self.y[val_idx]
             
-            # [CONSISTENCY_FIX] Use log-transform to match leakage-free loop
             y_tr_log = np.log1p(y_tr)
             y_val_log = np.log1p(y_val)
             
             model = LGBMRegressor(**Config.RAW_LGBM_PARAMS)
-            SAFE_FIT(model, X_tr, y_tr_log, eval_set=[(X_val, y_val_log)], eval_metric="mae")
-            self.oof[val_idx] = np.expm1(SAFE_PREDICT(model, X_val))
+            utils.SAFE_FIT(model, X_tr, y_tr_log, eval_set=[(X_val, y_val_log)], eval_metric="mae")
+            self.oof[val_idx] = np.expm1(utils.SAFE_PREDICT(model, X_val))
             fold_mae = mean_absolute_error(y_val, self.oof[val_idx])
             logger.info(f"[RAW_FOLD {fold}] MAE: {fold_mae:.4f}")
         # [OOF_GAP_FIX] NaN-safe MAE calculation
@@ -189,6 +232,9 @@ class Trainer:
             overall_mae = 0.0
             logger.warning("[TRAINER] No valid OOF predictions. MAE set to 0.0")
             
+        # [PHASE_ARTIFACT_SYNC] Persist OOF after baseline completion
+        save_npy(self.oof, f"{Config.PREDICTIONS_PATH}/oof_final.npy")
+        
         return overall_mae, self.oof
 
     def fit_leakage_free_model(self):
@@ -196,7 +242,8 @@ class Trainer:
         logger.info("[TRAINER] Starting structural corrected leakage‑free training (2‑pass)...")
         # [SSOT] Initialize drift data and thresholds for use in both PCA and pruning
         drift_df = self.drift_df if self.drift_df is not None else pd.DataFrame(columns=["feature", "ks_stat"])
-        ks_threshold = self.ks_threshold if self.ks_threshold is not None else 0.15
+        # [FORENSIC #32] Relax PCA threshold slightly from 0.15 to 0.20 to avoid trivial dimensionality reduction
+        ks_threshold = self.ks_threshold if self.ks_threshold is not None else 0.20
         
         raw_cols = [c for c in FEATURE_SCHEMA["raw_features"] if c in self.df_train.columns]
         splits = self._get_time_aware_splits()
@@ -205,16 +252,19 @@ class Trainer:
         per_fold_data = []
         for fold, (tr_idx, val_idx) in enumerate(splits):
             logger.info(f"━━━━━━━━━━━━━━━━ FIRST‑PASS FOLD {fold} ━━━━━━━━━━━━━━━━")
-            FEATURE_LINEAGE.clear()
+            # [FORENSIC #24] Do NOT clear FEATURE_LINEAGE per fold — lineage must persist for conditional protection
             tr_df = self.df_train.iloc[tr_idx].copy()
             val_df = self.df_train.iloc[val_idx].copy()
             test_df_fold = self.df_test.copy()
-            # Layout stats
+            # Layout stats (MUST be fold-specific)
             layout_stats = self._compute_fold_layout_stats(tr_df)
             tr_df = self._apply_layout_stats(tr_df, layout_stats)
             val_df = self._apply_layout_stats(val_df, layout_stats)
             test_df_fold = self._apply_layout_stats(test_df_fold, layout_stats)
-            # Time‑series & bucketing & scenario context
+            
+            # [FORENSIC #27/#28] RESTORED calls to prevent SCHEMA_CRITICAL_FAILURE.
+            # While redundant if Phase 2 kept them, they are MANDATORY if Phase 2 dropped them
+            # to ensure the full FEATURE_SCHEMA is populated for downstream audit checks.
             tr_df = add_time_series_features(tr_df)
             val_df = add_time_series_features(val_df)
             test_df_fold = add_time_series_features(test_df_fold)
@@ -222,10 +272,12 @@ class Trainer:
             tr_df = add_scenario_context_features(tr_df)
             val_df = add_scenario_context_features(val_df)
             test_df_fold = add_scenario_context_features(test_df_fold)
+            
             bucket_edges = {}
-            tr_df = add_extreme_detection_features(tr_df, bucket_edges=bucket_edges)
-            val_df = add_extreme_detection_features(val_df, bucket_edges=bucket_edges)
-            test_df_fold = add_extreme_detection_features(test_df_fold, bucket_edges=bucket_edges)
+            extreme_quantiles = {}
+            tr_df = add_extreme_detection_features(tr_df, extreme_quantiles=extreme_quantiles, bucket_edges=bucket_edges)
+            val_df = add_extreme_detection_features(val_df, extreme_quantiles=extreme_quantiles, bucket_edges=bucket_edges)
+            test_df_fold = add_extreme_detection_features(test_df_fold, extreme_quantiles=extreme_quantiles, bucket_edges=bucket_edges)
             # Scaling
             scaler = DriftShieldScaler()
             scaler.fit(tr_df, raw_cols)
@@ -240,6 +292,9 @@ class Trainer:
             
             test_df_scaled = scaler.transform(test_df_fold, raw_cols)
             test_df_scaled[raw_cols] = norm_scaler.transform(test_df_scaled[raw_cols])
+            
+            # [FORENSIC #13] Persist train-derived column means for Phase 7
+            train_col_means = {col: float(tr_df[col].mean()) for col in raw_cols if col in tr_df.columns}
 
             # [MISSION 3.1: PCA DRIFT FILTERING]
             # Why: Including drifted features in PCA contaminates ALL latent features.
@@ -279,8 +334,17 @@ class Trainer:
             # [MISSION 3: AGGRESSIVE COLLECTIVE DRIFT SUPPRESSION]
             # Why: Previous settings (5/5) were too conservative for 700+ features (AUC stayed at 0.98).
             # Fix: Increase iterations and step size to force AUC below 0.75.
+            # Perform iterative pruning to neutralize domain shift artifacts
+            # [MISSION_CRITICAL] Prune relative to TEST distribution, not validation fold
+            # Pruning relative to validation (within-distribution) fails to detect actual domain shift.
+            # [KEYERROR_FIX] Use test_df_scaled (processed) instead of raw self.df_test
+            drift_proxy = test_df_scaled if test_df_scaled is not None else val_df_scaled
+            
+            # [FORENSIC #31] Pass fold index + 42 to ensure different sampling per fold
             pruner = CollectiveDriftPruner(target_auc=Config.ADV_TARGET_AUC, max_iterations=20, prune_step=50)
-            stable_features, _ = pruner.prune(tr_df_scaled, test_df_scaled, initial_features, protected_cols=protected_cols)
+            stable_features, _ = pruner.prune(tr_df_scaled, drift_proxy, initial_features, 
+                                             protected_cols=protected_cols, base_seed=42 + fold)
+            
             # Latent features are already applied, just filter by stable set
             tr_df_full = tr_df_scaled[list(set(stable_features) | set(Config.ID_COLS))]
             val_df_full = val_df_scaled[list(set(stable_features) | set(Config.ID_COLS))]
@@ -294,6 +358,8 @@ class Trainer:
                 "reconstructor": reconstructor,
                 "layout_stats": layout_stats,
                 "bucket_edges": bucket_edges,
+                "extreme_quantiles": extreme_quantiles,
+                "train_col_means": train_col_means,
                 "raw_cols": raw_cols,
                 "fold": fold,
             })
@@ -360,83 +426,91 @@ class Trainer:
             
             # 2-Stage Model Training
             if Config.USE_2STAGE_MODEL:
-                # [SSOT_FIX] Local import removed
+                # Stage 1: Classifier
                 # Stage 1: Tail Classifier (Q90)
                 q90_val = np.quantile(y_tr, 0.90)
                 y_tr_binary = (y_tr >= q90_val).astype(int)
                 y_val_binary = (y_val >= q90_val).astype(int)
                 
+                # [TARGETING RECONSTRUCTION] Quarantine POISON features for classifier ONLY
+                clf_features = [f for f in sorted_features if f not in getattr(Config, 'CLASSIFIER_POISON_FEATURES', [])]
+                X_tr_clf = tr_df_full[clf_features].values.astype(np.float32)
+                X_val_clf = val_df_full[clf_features].values.astype(np.float32)
+                
                 model_clf = LGBMClassifier(**Config.TAIL_CLASSIFIER_PARAMS)
-                model_clf.fit(X_tr_fold, y_tr_binary, eval_set=[(X_val_fold, y_val_binary)], eval_metric="auc")
+                # [SAFE_GATEWAY] Enforce numpy-only, float32-only, zero-hardcode name contract
+                utils.SAFE_FIT(model_clf, X_tr_clf, y_tr_binary, eval_set=[(X_val_clf, y_val_binary)], eval_metric="auc")
                 
-                # Stage 2: Separate Regressors
+                # Stage 2: Regressors (Tail vs Non-Tail)
                 tail_mask = y_tr >= q90_val
-                # Tail Regressor (using L2/regression for scale)
-                model_tail = LGBMRegressor(**Config.TAIL_REGRESSOR_PARAMS)
-                model_tail.fit(X_tr_fold[tail_mask], np.log1p(y_tr[tail_mask]), sample_weight=sample_weight[tail_mask] if sample_weight is not None else None)
+                # [ARCHITECTURAL RECONSTRUCTION] Prune Destructive Features
+                tail_features = [f for f in sorted_features if f not in Config.TAIL_DESTRUCTIVE_FEATURES]
+                X_tr_tail = tr_df_full[tail_features].values.astype(np.float32)
+                X_val_tail = val_df_full[tail_features].values.astype(np.float32)
                 
-                # Non-Tail Regressor (using L1/regression_l1 for MAE)
-                model_non_tail = LGBMRegressor(**Config.NON_TAIL_REGRESSOR_PARAMS)
-                model_non_tail.fit(X_tr_fold[~tail_mask], np.log1p(y_tr[~tail_mask]), sample_weight=sample_weight[~tail_mask] if sample_weight is not None else None)
+                # Tail Regressor
+                model_tail = LGBMRegressor(**Config.TAIL_REGRESSOR_PARAMS)
+                utils.SAFE_FIT(
+                    model_tail, X_tr_tail[tail_mask], np.log1p(y_tr[tail_mask]),
+                    sample_weight=sample_weight[tail_mask] if sample_weight is not None else None,
+                    eval_set=[(X_val_tail, np.log1p(y_val))], eval_metric="mae",
+                    callbacks=[lambda env: None]
+                )
+                
+                # Non-Tail Regressor
+                non_tail_params = Config.NON_TAIL_REGRESSOR_PARAMS.copy()
+                model_non_tail = LGBMRegressor(**non_tail_params)
+                utils.SAFE_FIT(
+                    model_non_tail, X_tr_fold[~tail_mask], np.log1p(y_tr[~tail_mask]),
+                    sample_weight=sample_weight[~tail_mask] if sample_weight is not None else None,
+                    eval_set=[(X_val_fold, np.log1p(y_val))], eval_metric="mae",
+                    callbacks=[lambda env: None]
+                )
                 
                 # [FINAL SIMPLICITY: POWER-DAMPED BLENDING]
-                # [WHY] Fast validation proved that simple p^2 damping outperforms complex EV logic.
-                # [STRATEGY] Use power-scaled probability (p^2) to naturally suppress noise while allowing high-conf tail.
-                p_val_raw = model_clf.predict_proba(X_val_fold)[:, 1]
-                preds_t = np.expm1(model_tail.predict(X_val_fold))
-                preds_nt = np.expm1(model_non_tail.predict(X_val_fold))
+                p_val_raw = utils.SAFE_PREDICT_PROBA(model_clf, X_val_clf)[:, 1]
+                preds_t = np.expm1(utils.SAFE_PREDICT(model_tail, X_val_tail))
+                preds_nt = np.expm1(utils.SAFE_PREDICT(model_non_tail, X_val_fold))
                 
-                # Weighting: Quadratic damping (p^2) to protect against low-p false positives
-                final_weight = p_val_raw ** 2.0
+                # [ARCHITECTURAL RECONSTRUCTION: MULTI-SIGNAL GATING]
+                final_weight = _multi_signal_blend(p_val_raw, preds_t, preds_nt)
                 
-                # [MISSION 6: JENSEN_RECOVERY] Apply adaptive bias multiplier
-                recovery_factor = getattr(Config, 'BIAS_RECOVERY_FACTOR', 1.35)
+                risk_ctrl = TailRiskController(
+                    gap_threshold=Config.GAP_THRESHOLD,
+                    clf_floor=Config.CLF_TRUST_FLOOR,
+                    damp_factor=Config.SAFE_DAMP_FACTOR
+                )
                 
-                self.oof_base[splits[fold][1]] = preds_nt
-                self.oof[splits[fold][1]] = (final_weight * preds_t + (1.0 - final_weight) * preds_nt) * recovery_factor
+                gap = risk_ctrl.compute_gap(preds_t, preds_nt)
+                final_weight = risk_ctrl.apply(final_weight, p_val_raw, gap)
                 
-                model = {"clf": model_clf, "tail": model_tail, "non_tail": model_non_tail}
+                self.oof_base[val_idx] = preds_nt
+                self.oof[val_idx] = final_weight * preds_t + (1.0 - final_weight) * preds_nt
+                
+                model = {"clf": model_clf, "tail": model_tail, "non_tail": model_non_tail, "risk_ctrl": risk_ctrl, "clf_features": clf_features, "tail_features": tail_features}
             else:
-                # Legacy Single Stage
                 model = LGBMRegressor(**Config.RAW_LGBM_PARAMS, early_stopping_rounds=50)
-                SAFE_FIT(
-                    model,
-                    X_tr_fold,
-                    np.log1p(y_tr),
+                utils.SAFE_FIT(
+                    model, X_tr_fold, np.log1p(y_tr),
                     sample_weight=sample_weight,
                     eval_set=[(X_val_fold, np.log1p(y_val))],
                     eval_metric="mae",
                 )
-                # [MISSION 6: JENSEN_RECOVERY]
-                recovery_factor = getattr(Config, 'BIAS_RECOVERY_FACTOR', 1.35)
-                self.oof[splits[fold][1]] = np.expm1(SAFE_PREDICT(model, X_val_fold)) * recovery_factor
+                self.oof[val_idx] = np.expm1(utils.SAFE_PREDICT(model, X_val_fold))
             
             # [OOF_GAP_FIX] NaN-safe fold scoring
-            val_preds = self.oof[splits[fold][1]]
+            val_preds = self.oof[val_idx]
             mask_val = ~np.isnan(val_preds)
             if mask_val.any():
                 self.fold_scores.append(mean_absolute_error(y_val[mask_val], val_preds[mask_val]))
             else:
                 self.fold_scores.append(0.0)
-                logger.warning(f"[FOLD {fold}] No valid predictions to score. Set to 0.0")
             
-            # [TASK 7: LEAF VALUE MONITORING] (Analyze Tail model if 2-stage)
+            # [TASK 7: LEAF VALUE MONITORING]
             target_booster = model.booster_ if not Config.USE_2STAGE_MODEL else model["tail"].booster_
-            # [SSOT_FIX] Local import removed
             tree_str = str(target_booster.dump_model()['tree_info'])
             leaf_values = [float(x) for x in re.findall(r"'leaf_value':\s*([-+]?\d*\.\d+|\d+)", tree_str)]
-            leaf_stats = {
-                "max_abs": float(np.max(np.abs(leaf_values))) if leaf_values else 0,
-                "std": float(np.std(leaf_values)) if leaf_values else 0,
-                "p99_abs": float(np.percentile(np.abs(leaf_values), 99)) if leaf_values else 0
-            }
-            logger.info(f"[FOLD {fold} LEAF_AUDIT] MaxAbs: {leaf_stats['max_abs']:.4f} | Std: {leaf_stats['std']:.4f}")
-            
-            self.fold_stats.append({
-                "fold": fold,
-                "mae": float(self.fold_scores[-1]),
-                "leaf_stats": leaf_stats
-            })
+            self.fold_stats.append({"fold": fold, "mae": float(self.fold_scores[-1])})
             
             logger.info(f"━━━━━━━━━━━━━━━━ FOLD {fold} MAE: {self.fold_scores[-1]:.4f} ━━━━━━━━━━━━━━━━")
             # Test inference
@@ -445,16 +519,20 @@ class Trainer:
                 self.test_preds["final"] = np.zeros(len(self.df_test))
             
             if Config.USE_2STAGE_MODEL:
-                p_te_raw = model["clf"].predict_proba(X_te)[:, 1]
-                preds_t_te = np.expm1(model["tail"].predict(X_te))
-                preds_nt_te = np.expm1(model["non_tail"].predict(X_te))
+                X_te_clf = test_df_full[clf_features].values.astype(np.float32)
+                X_te_tail = test_df_full[tail_features].values.astype(np.float32)
                 
-                # Consistent damping for inference
-                final_weight_te = p_te_raw ** 2.0
+                p_te_raw = utils.SAFE_PREDICT_PROBA(model["clf"], X_te_clf)[:, 1]
+                preds_t_te = np.expm1(utils.SAFE_PREDICT(model["tail"], X_te_tail))
+                preds_nt_te = np.expm1(utils.SAFE_PREDICT(model["non_tail"], X_te))
                 
-                self.test_preds["final"] += (final_weight_te * preds_t_te + (1.0 - final_weight_te) * preds_nt_te) * recovery_factor / Config.NFOLDS
+                final_weight_te = _multi_signal_blend(p_te_raw, preds_t_te, preds_nt_te)
+                gap_te = model["risk_ctrl"].compute_gap(preds_t_te, preds_nt_te)
+                final_weight_te = model["risk_ctrl"].apply(final_weight_te, p_te_raw, gap_te)
+                
+                self.test_preds["final"] += (final_weight_te * preds_t_te + (1.0 - final_weight_te) * preds_nt_te) / Config.NFOLDS
             else:
-                self.test_preds["final"] += np.expm1(SAFE_PREDICT(model, X_te)) * recovery_factor / Config.NFOLDS
+                self.test_preds["final"] += np.expm1(utils.SAFE_PREDICT(model, X_te)) / Config.NFOLDS
             
             # Persistence
             fold_dir = f"{Config.MODELS_PATH}/reconstructors"
@@ -472,8 +550,39 @@ class Trainer:
                 pickle.dump(fold_data["layout_stats"], f)
             with open(f"{fold_dir}/bucket_edges_fold_{fold}.pkl", "wb") as f:
                 pickle.dump(fold_data["bucket_edges"], f)
+            with open(f"{fold_dir}/extreme_quantiles_fold_{fold}.pkl", "wb") as f:
+                pickle.dump(fold_data["extreme_quantiles"], f)
+            with open(f"{fold_dir}/train_col_means_fold_{fold}.pkl", "wb") as f:
+                pickle.dump(fold_data["train_col_means"], f)
+            with open(f"{fold_dir}/risk_ctrl_fold_{fold}.pkl", "wb") as f:
+                pickle.dump(risk_ctrl, f)
             with open(f"{Config.MODELS_PATH}/lgbm/model_fold_{fold}.pkl", "wb") as f:
                 pickle.dump(model, f)
+            
+            # [FORENSIC #13/#14] Persist per-fold train_col_means and extreme_quantiles
+            # for Phase 7 inference to eliminate test distribution leakage
+            fold_train_df = self.df_train.iloc[splits[fold][0]]
+            fold_train_col_means = {
+                col: float(fold_train_df[col].mean())
+                for col in fold_train_df.columns
+                if col not in Config.ID_COLS and not fold_train_df[col].isna().all()
+            }
+            with open(f"{fold_dir}/train_col_means_fold_{fold}.pkl", "wb") as f:
+                pickle.dump(fold_train_col_means, f)
+            
+            # Compute and save extreme quantiles from fold training data
+            fold_extreme_quantiles = {}
+            key_extreme_cols = ['order_inflow_15m', 'robot_utilization', 'congestion_score', 'near_collision_15m']
+            for c in key_extreme_cols:
+                if c in fold_train_df.columns:
+                    fold_extreme_quantiles[c] = float(fold_train_df[c].quantile(0.95))
+            # Also save util_rel_p90 if available
+            if 'robot_utilization_rel_to_mean_5' in fold_train_df.columns:
+                vals = fold_train_df['robot_utilization_rel_to_mean_5'].dropna()
+                if len(vals) > 0:
+                    fold_extreme_quantiles['util_rel_p90'] = float(np.quantile(vals, 0.90))
+            with open(f"{fold_dir}/extreme_quantiles_fold_{fold}.pkl", "wb") as f:
+                pickle.dump(fold_extreme_quantiles, f)
             
             # [GLOBAL_FALLBACK_FIX] Save global training means for new-layout inference
             if self.manifest and hasattr(self.manifest, 'train_col_means'):
@@ -529,12 +638,10 @@ class Trainer:
             std_ratio_est = float(dist_stats.get('std_ratio', 0.5))
             p99_ratio_est = float(dist_stats.get('p99_ratio', 0.5))
             
-            # [CONSERVATIVE] Use worst-case adv_auc placeholder until perform_adversarial_audit()
-            #   is called. This ensures the report flags risk even before audit completes.
-            placeholder_adv_auc = 0.85  # Consistent with observed range 0.80-0.95
+            # [FORENSIC #19] Compute ACTUAL adv_auc instead of hardcoded placeholder
+            actual_adv_auc = self.perform_adversarial_audit()
+            self.metadata["adv_auc"] = actual_adv_auc
             
-            # [v4.0] Pass baseline to build_metrics for execution analytics
-            # [SSOT_FIX] Local import removed
             final_metrics = build_metrics(self.y, self.oof, y_base=self.oof_base)
             
             cv_report_path = f"{Config.LOG_DIR}/cv_reliability_report.txt"
@@ -542,7 +649,7 @@ class Trainer:
                 fold_maes=self.fold_scores,
                 oof_preds=self.oof,
                 y_train=self.y,
-                adv_auc=placeholder_adv_auc,
+                adv_auc=actual_adv_auc,
                 mean_ratio=mean_ratio_est,
                 std_ratio=std_ratio_est,
                 p99_ratio=p99_ratio_est,
@@ -554,17 +661,14 @@ class Trainer:
             # [NON-BLOCKING] CV reliability report failure must not block training output
             logger.warning(f"[CV_RELIABILITY] Report generation failed (non-critical): {cv_err}")
         
+        # [PHASE_ARTIFACT_SYNC] Persist OOF after leakage-free completion
+        save_npy(self.oof, f"{Config.PREDICTIONS_PATH}/oof_final.npy")
+        
         return overall_mae, self.oof
-
-    def analyze_model_divergence(self):
-        """Analyzes correlation and divergence between folds."""
-        if not self.models:
-            return 1.0, 0.0
-        return 0.95, 0.05
 
     def validate_distribution(self, test_preds, train_stats):
         """Final sanity check to ensure test predictions don't collapse relative to train stats."""
-        auditor = DomainShiftAudit()
+        # [FORENSIC #22/#23] Removed unused DomainShiftAudit and fake analyze_model_divergence
         ratio, p_std, t_std, m_ratio = calculate_std_ratio(test_preds, train_stats)
         logger.info(f"[DIST_GUARD] Std Ratio: {ratio:.4f} (Pred: {p_std:.4f}, Train: {t_std:.4f})")
         logger.info(f"[DIST_GUARD] Mean Ratio: {m_ratio:.4f}")
@@ -581,8 +685,8 @@ class Trainer:
         X = np.vstack([X_tr, X_te])
         y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))])
         adv_clf = LGBMClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42, verbose=-1)
-        adv_clf.fit(X, y)
-        probs = adv_clf.predict_proba(X_tr)[:, 1]
+        utils.SAFE_FIT(adv_clf, X.astype(np.float32), y.astype(np.float32))
+        probs = utils.SAFE_PREDICT_PROBA(adv_clf, X_tr.astype(np.float32))[:, 1]
         weights = probs / (1.0 - probs)
         if Config.ADV_WEIGHT_POWER != 1.0:
             weights = weights ** Config.ADV_WEIGHT_POWER
@@ -605,8 +709,8 @@ class Trainer:
         aucs = []
         for tr_idx, val_idx in skf.split(X, y):
             adv_clf = LGBMClassifier(n_estimators=100, max_depth=3, learning_rate=0.1, random_state=42, verbose=-1)
-            adv_clf.fit(X[tr_idx], y[tr_idx])
-            probs = adv_clf.predict_proba(X[val_idx])[:, 1]
+            utils.SAFE_FIT(adv_clf, X[tr_idx].astype(np.float32), y[tr_idx].astype(np.float32))
+            probs = utils.SAFE_PREDICT_PROBA(adv_clf, X[val_idx].astype(np.float32))[:, 1]
             aucs.append(roc_auc_score(y[val_idx], probs))
         avg_auc = np.mean(aucs)
         logger.info(f"[AUDIT] Final Adversarial AUC: {avg_auc:.4f}")

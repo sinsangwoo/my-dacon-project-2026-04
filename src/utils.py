@@ -372,10 +372,11 @@ def build_metrics(y_true, y_pred, y_base=None):
             execution_metrics["fp_cost"] = float(np.mean(pred_err[fp_mask] - base_err[fp_mask]))
             
         # Gain Capture: How much of the potential MAE improvement did we actually get?
-        # Oracle Gain = sum(base_err - true_tail_err) where base_err > true_tail_err
-        potential_gain = np.sum(np.maximum(0, base_err - np.abs(y_true - y_true))) # This is just base_err where we could improve
+        # [FORENSIC #18] Fixed: previous formula had np.abs(y_true - y_true) = 0 always
+        # potential_gain = total baseline error (maximum possible improvement)
+        potential_gain = np.sum(base_err)
         actual_gain = np.sum(np.maximum(0, base_err - pred_err))
-        execution_metrics["gain_capture"] = float(actual_gain / (np.sum(base_err) + 1e-9))
+        execution_metrics["gain_capture"] = float(actual_gain / (potential_gain + 1e-9))
 
     metrics = {
         "mean_mae": mae,

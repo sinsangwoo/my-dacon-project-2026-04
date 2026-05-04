@@ -4,7 +4,7 @@ from sklearn.linear_model import Ridge
 from sklearn.metrics import mean_absolute_error
 
 from .config import Config
-from .utils import SAFE_FIT, SAFE_PREDICT
+from . import utils
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,9 @@ class ExplosionInference:
         
         # 3. Ridge Stacking (Continuous Weighting, NO Alpha Collapse)
         model = Ridge(alpha=1.0)
-        SAFE_FIT(model, X_meta_tr, y_train)
+        utils.SAFE_FIT(model, X_meta_tr, y_train)
         
-        final_preds = SAFE_PREDICT(model, X_meta_te)
+        final_preds = utils.SAFE_PREDICT(model, X_meta_te)
         
         # 4. Clipping
         final_preds = np.clip(final_preds, 0.0, train_stats['p99'] * 1.5)

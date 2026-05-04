@@ -9,12 +9,19 @@ from pathlib import Path
 from datetime import datetime
 import argparse
 import pickle
+from src.trainer import (
+    Trainer, 
+    TailRiskController, 
+    _sigmoid_gate, 
+    _multi_signal_blend
+)
 
 # Suppress warnings
 warnings.filterwarnings("ignore", category=pd.errors.PerformanceWarning)
 
 from src.config import Config
 from src.schema import FEATURE_SCHEMA
+from src import utils
 from src.utils import (
     seed_everything, 
     get_logger, 
@@ -29,9 +36,7 @@ from src.utils import (
     calculate_risk_score,
     save_json,
     assert_artifact_exists,
-    downcast_df,
-    SAFE_FIT,
-    SAFE_PREDICT
+    downcast_df
 )
 from src.data_loader import (
     load_data, 
@@ -44,7 +49,6 @@ from src.data_loader import (
     add_scenario_context_features,
     apply_latent_features
 )
-from src.trainer import Trainer
 from src.explosion_inference import ExplosionInference
 from src.distribution import DomainShiftAudit, FeatureStabilityFilter
 from src.intelligence import ExperimentIntelligence
@@ -261,6 +265,7 @@ def run_phase(phase, mode, smoke_test=False):
             
             # [ARTIFACT_HANDOVER] Save raw results for Phase 6 (Calibration)
             save_npy(oof_final, f'{Config.PREDICTIONS_PATH}/oof_raw.npy')
+            save_npy(trainer.oof_base, f'{Config.PREDICTIONS_PATH}/oof_base_raw.npy')
             save_npy(trainer.test_preds['final'], f'{Config.PREDICTIONS_PATH}/test_raw.npy')
             
             # Save logs and initial audit
@@ -271,51 +276,74 @@ def run_phase(phase, mode, smoke_test=False):
             
             logger.info("[PHASE_SUCCESS] 5_train_leakage_free - Raw artifacts saved for calibration.")
             
+            # [MEMORY_OPTIMIZATION] Clean up heavy objects
+            del trainer, oof_final, y, sid, train_base, test_base, drift_df, stability_manifest
+            gc.collect()
+            
         elif phase == '6_calibrate':
             # [DYNAMIC_BIAS_RECOVERY] 
             # Why: Separated from training to allow post-training recalibration.
             y = load_npy(f'{Config.PROCESSED_PATH}/y_train.npy')
             oof_raw = load_npy(f'{Config.PREDICTIONS_PATH}/oof_raw.npy')
+            oof_base_raw = load_npy(f'{Config.PREDICTIONS_PATH}/oof_base_raw.npy')
             test_raw = load_npy(f'{Config.PREDICTIONS_PATH}/test_raw.npy')
             
             valid_mask = ~np.isnan(oof_raw)
             oof_mean = np.mean(oof_raw[valid_mask])
             true_mean = np.mean(y[valid_mask])
-            dynamic_bias_scalar = float(true_mean / (oof_mean + 1e-9))
+            oof_std = np.std(oof_raw[valid_mask])
+            true_std = np.std(y[valid_mask])
             
-            # Safety clipping [0.9, 1.5]
-            dynamic_bias_scalar = max(0.9, min(1.5, dynamic_bias_scalar))
+            mean_scalar = float(true_mean / (oof_mean + 1e-9))
+            std_scalar = float(true_std / (oof_std + 1e-9))
             
+            # [CONTROLLED AGGRESSION] Limit variance recovery to prevent instability
+            if Config.VARIANCE_RECOVERY_ENABLED:
+                std_scalar = min(Config.STD_SCALAR_CAP, std_scalar)
+            else:
+                std_scalar = 1.0
+                
             logger.info(f"[CALIBRATION] OOF Mean: {oof_mean:.4f} | True Mean: {true_mean:.4f}")
-            logger.info(f"[CALIBRATION] Final Scalar: {dynamic_bias_scalar:.4f}")
+            logger.info(f"[CALIBRATION] OOF Std: {oof_std:.4f} | True Std: {true_std:.4f}")
+            logger.info(f"[CALIBRATION] Mean Scalar: {mean_scalar:.4f} | Std Scalar: {std_scalar:.4f}")
             
-            # Apply and save
-            oof_stable = oof_raw * dynamic_bias_scalar
-            test_stable = test_raw * dynamic_bias_scalar
+            # Apply and save: oof_recovered = (oof - oof_mean) * std_scalar + true_mean
+            oof_stable = (oof_raw - oof_mean) * std_scalar + true_mean
+            test_stable = (test_raw - oof_mean) * std_scalar + true_mean
             
             save_npy(oof_stable, f'{Config.PREDICTIONS_PATH}/oof_stable.npy')
             save_npy(test_stable, f'{Config.PREDICTIONS_PATH}/test_stable.npy')
             
             # [MISSION 9: INTELLIGENCE_SYNC] Update registry with calibrated metrics
-            stable_metrics = build_metrics(y, oof_stable)
+            # [FORENSIC FIX] Pass y_base to enable Gain Capture tracking
+            stable_metrics = build_metrics(y, oof_stable, y_base=oof_base_raw)
             
-            # Load previous metadata and risks
+            # Recalculate risk score using calibrated metrics and original adv_auc
             intelligence = ExperimentIntelligence()
             prev_run = next((r for r in intelligence.registry["runs"] if r["run_id"] == Config.RUN_ID), {})
+            adv_auc = prev_run.get("adv_auc", 0.5)
+            
+            risk_results = calculate_risk_score(stable_metrics, adv_auc, fold_maes=prev_run.get("fold_stats", []))
+            risk_score = risk_results['total']
             
             intelligence.log_experiment_audit(
                 Config.RUN_ID, 
                 stable_metrics, 
-                prev_run.get("adv_auc", 0.5), 
-                prev_run.get("risk_score", 0.0),
+                adv_auc, 
+                risk_results, 
                 fold_stats=prev_run.get("fold_stats", []),
                 metadata=prev_run.get("metadata", {})
             )
             logger.info(f"[SYNC] Registry updated with calibrated MAE: {stable_metrics['mae']:.4f}")
-            # [SSOT] Ensure Phase 8 can pick this up directly if Phase 7 is skipped
-            save_npy(test_stable, f'{Config.PREDICTIONS_PATH}/final_submission.npy')
-            # Also save for cold-inference in Phase 7
-            save_json({"dynamic_bias_scalar": dynamic_bias_scalar}, f'{Config.LOG_DIR}/calibration.json')
+            # [FORENSIC #4] Phase 6 saves detailed calibration metadata for Phase 7
+            save_json({
+                "mean_scalar": mean_scalar,
+                "std_scalar": std_scalar,
+                "oof_mean": float(oof_mean),
+                "true_mean": float(true_mean)
+            }, f'{Config.LOG_DIR}/calibration.json')
+            save_json(risk_results, f'{Config.LOG_DIR}/risk_breakdown.json')
+            
             
             # Final distribution validation
             # [SSOT_FIX] Local import removed
@@ -332,6 +360,17 @@ def run_phase(phase, mode, smoke_test=False):
             n_test = len(test_base)
             test_preds = np.zeros(n_test)
             
+            # [FORENSIC #3] Load calibration metadata — SOLE bias correction path
+            try:
+                calib_data = json.load(open(f'{Config.LOG_DIR}/calibration.json'))
+                oof_mean_cal = calib_data.get("oof_mean", 0.0)
+                true_mean_cal = calib_data.get("true_mean", 0.0)
+                std_scalar_cal = calib_data.get("std_scalar", 1.0)
+            except:
+                logger.warning("[INFERENCE] Calibration metadata missing. Using defaults.")
+                oof_mean_cal, true_mean_cal, std_scalar_cal = 0.0, 0.0, 1.0
+            logger.info(f"[INFERENCE] Calibration: MeanOffset={true_mean_cal-oof_mean_cal:.4f}, StdScalar={std_scalar_cal:.4f}")
+            
             for fold in range(Config.NFOLDS):
                 logger.info(f"[INFERENCE] Processing Fold {fold}...")
                 
@@ -341,7 +380,24 @@ def run_phase(phase, mode, smoke_test=False):
                 with open(f'{Config.MODELS_PATH}/reconstructors/norm_scaler_fold_{fold}.pkl', 'rb') as f: norm_scaler = pickle.load(f)
                 with open(f'{Config.MODELS_PATH}/reconstructors/layout_stats_fold_{fold}.pkl', 'rb') as f: layout_stats = pickle.load(f)
                 with open(f'{Config.MODELS_PATH}/reconstructors/bucket_edges_fold_{fold}.pkl', 'rb') as f: bucket_edges = pickle.load(f)
+                with open(f'{Config.MODELS_PATH}/reconstructors/risk_ctrl_fold_{fold}.pkl', 'rb') as f: risk_ctrl = pickle.load(f)
                 with open(f'{Config.MODELS_PATH}/lgbm/model_fold_{fold}.pkl', 'rb') as f: model = pickle.load(f)
+                
+                # [FORENSIC #13] Load train-derived column means to prevent test distribution leakage
+                try:
+                    with open(f'{Config.MODELS_PATH}/reconstructors/train_col_means_fold_{fold}.pkl', 'rb') as f:
+                        train_col_means = pickle.load(f)
+                except FileNotFoundError:
+                    logger.warning(f"[INFERENCE] train_col_means_fold_{fold}.pkl not found. Falling back to None (test leakage risk).")
+                    train_col_means = None
+                
+                # [FORENSIC #14] Load train-derived extreme quantiles
+                try:
+                    with open(f'{Config.MODELS_PATH}/reconstructors/extreme_quantiles_fold_{fold}.pkl', 'rb') as f:
+                        extreme_quantiles = pickle.load(f)
+                except FileNotFoundError:
+                    logger.warning(f"[INFERENCE] extreme_quantiles_fold_{fold}.pkl not found. Falling back to None.")
+                    extreme_quantiles = None
 
                 # Apply fold-specific transformations
                 test_fold = test_base.copy()
@@ -353,14 +409,14 @@ def run_phase(phase, mode, smoke_test=False):
                     stat_type = "mean" if "mean" in feat else "std"
                     
                     # [GLOBAL_FALLBACK] Handle new layouts (40% of test set)
-                    # Use global mean/std from training as the behavior baseline.
                     fallback = layout_stats.get(f"{base_col}_global_{stat_type}", 0.0)
                     test_fold[feat] = test_fold['layout_id'].map(mapping).fillna(fallback)
                 
-                test_fold = add_time_series_features(test_fold)
-                # [MISSION: SCENARIO CONTEXT] Inject regime intelligence into test-time inference
+                # [FORENSIC #13] Pass train_col_means to prevent test leakage
+                test_fold = add_time_series_features(test_fold, train_col_means=train_col_means)
                 test_fold = add_scenario_context_features(test_fold)
-                test_fold = add_extreme_detection_features(test_fold, bucket_edges=bucket_edges)
+                # [FORENSIC #14] Pass extreme_quantiles to prevent test leakage
+                test_fold = add_extreme_detection_features(test_fold, extreme_quantiles=extreme_quantiles, bucket_edges=bucket_edges)
                 
                 # Apply scaling
                 raw_cols = list(norm_scaler.feature_names_in_)
@@ -372,30 +428,40 @@ def run_phase(phase, mode, smoke_test=False):
                 X_test_f = test_df_full[fold_features].values.astype(np.float32)
                 
                 if Config.USE_2STAGE_MODEL:
-                    # 2-Stage Sharpened Blending (Mission: Scale Recovery)
-                    p_te = model["clf"].predict_proba(X_test_f)[:, 1]
-                    preds_t = np.expm1(model["tail"].predict(X_test_f))
-                    preds_nt = np.expm1(model["non_tail"].predict(X_test_f))
+                    # [ARCHITECTURAL RECONSTRUCTION] Feature Set Synchronization
+                    clf_features = model.get("clf_features", [f for f in fold_features if f not in getattr(Config, 'CLASSIFIER_POISON_FEATURES', [])])
+                    tail_features = model.get("tail_features", [f for f in fold_features if f not in getattr(Config, 'TAIL_DESTRUCTIVE_FEATURES', [])])
                     
-                    # [DYNAMIC_BIAS_RECOVERY_SYNC]
-                    # Load the dynamic scalar calculated in Phase 6
-                    try:
-                        calib_data = json.load(open(f'{Config.LOG_DIR}/calibration.json'))
-                        current_bias = calib_data.get("dynamic_bias_scalar", Config.BIAS_SCALAR)
-                    except:
-                        logger.warning("[INFERENCE] Calibration metadata missing. Falling back to Config.BIAS_SCALAR.")
-                        current_bias = Config.BIAS_SCALAR
-                        
-                    p_te_sharpened = p_te ** Config.BLENDING_POWER
-                    test_preds += (p_te_sharpened * preds_t + (1.0 - p_te_sharpened) * preds_nt) * current_bias / Config.NFOLDS
+                    X_test_clf = test_df_full[clf_features].values.astype(np.float32)
+                    X_test_tail = test_df_full[tail_features].values.astype(np.float32)
+                    
+                    p_te = utils.SAFE_PREDICT_PROBA(model["clf"], X_test_clf)[:, 1]
+                    preds_t = np.expm1(utils.SAFE_PREDICT(model["tail"], X_test_tail))
+                    preds_nt = np.expm1(utils.SAFE_PREDICT(model["non_tail"], X_test_f))
+                    
+                    # [ARCHITECTURAL RECONSTRUCTION: MULTI-SIGNAL GATING]
+                    p_te_sharpened = _multi_signal_blend(p_te, preds_t, preds_nt)
+                    
+                    gap_te = risk_ctrl.compute_gap(preds_t, preds_nt)
+                    p_te_sharpened = risk_ctrl.apply(p_te_sharpened, p_te, gap_te)
+                    
+                    # Combine
+                    fold_preds = p_te_sharpened * preds_t + (1.0 - p_te_sharpened) * preds_nt
+                    
+                    # [FORENSIC #3] Apply calibration formula: (pred - oof_mean) * std_scalar + true_mean
+                    test_preds += ((fold_preds - oof_mean_cal) * std_scalar_cal + true_mean_cal) / Config.NFOLDS
                 else:
-                    fold_preds_log = SAFE_PREDICT(model, X_test_f)
-                    test_preds += np.expm1(fold_preds_log) / Config.NFOLDS
+                    fold_preds_raw = np.expm1(utils.SAFE_PREDICT(model, X_test_f))
+                    test_preds += ((fold_preds_raw - oof_mean_cal) * std_scalar_cal + true_mean_cal) / Config.NFOLDS
                 
                 del reconstructor, scaler, norm_scaler, model, test_df_full, test_fold, test_fold_drifted, test_fold_scaled, X_test_f
                 gc.collect()
             
             save_npy(test_preds, f'{Config.PREDICTIONS_PATH}/final_submission.npy')
+            
+            # [MEMORY_OPTIMIZATION] Clean up heavy objects
+            del test_preds
+            gc.collect()
 
         elif phase == '8_submission':
             final_preds = load_npy(f'{Config.PREDICTIONS_PATH}/final_submission.npy')

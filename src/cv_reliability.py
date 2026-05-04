@@ -37,6 +37,9 @@ from lightgbm import LGBMClassifier
 from scipy.stats import ks_2samp
 from sklearn.metrics import mean_absolute_error, roc_auc_score
 from sklearn.model_selection import StratifiedKFold
+from .config import Config
+from . import utils
+from .utils import downcast_df
 
 logger = logging.getLogger(__name__)
 
@@ -90,12 +93,14 @@ class CVPipelineAnalyzer:
         Result: OOF MAE is NOT measuring a single consistent model state.
         """
         unique_scenarios = self.get_scenario_order(self.df_train)
-        chunks = np.array_split(unique_scenarios, self.n_folds + 1)
+        chunks = np.array_split(unique_scenarios, self.n_folds + 2)
 
         fold_stats = []
-        train_scenarios = list(chunks[0])
+        # [SYNCHRONIZATION_FIX] Match trainer.py: train starts with chunks 0 and 1
+        train_scenarios = list(chunks[0]) + list(chunks[1])
         for fold in range(self.n_folds):
-            val_scenarios = list(chunks[fold + 1])
+            # Validation set starts from Chunk 2
+            val_scenarios = list(chunks[fold + 2])
             tr_idx = self.df_train[self.df_train["scenario_id"].isin(train_scenarios)].index
             val_idx = self.df_train[self.df_train["scenario_id"].isin(val_scenarios)].index
 
@@ -150,12 +155,14 @@ class CVPipelineAnalyzer:
             ]
 
         unique_scenarios = self.get_scenario_order(self.df_train)
-        chunks = np.array_split(unique_scenarios, self.n_folds + 1)
-
+        chunks = np.array_split(unique_scenarios, self.n_folds + 2)
+        
+        # Match trainer.py initial set
+        train_scenarios = list(chunks[0]) + list(chunks[1])
+        
         fold_ks_results = []
-        train_scenarios = list(chunks[0])
         for fold in range(self.n_folds):
-            val_scenarios = list(chunks[fold + 1])
+            val_scenarios = list(chunks[fold + 2])
             val_df = self.df_train[self.df_train["scenario_id"].isin(val_scenarios)]
 
             ks_scores = []
@@ -227,12 +234,14 @@ class CVPipelineAnalyzer:
             ]
 
         unique_scenarios = self.get_scenario_order(self.df_train)
-        chunks = np.array_split(unique_scenarios, self.n_folds + 1)
+        chunks = np.array_split(unique_scenarios, self.n_folds + 2)
 
         fold_adv_results = []
-        train_scenarios = list(chunks[0])
+        # [SYNCHRONIZATION_FIX] Match trainer.py: train starts with chunks 0 and 1
+        train_scenarios = list(chunks[0]) + list(chunks[1])
         for fold in range(self.n_folds):
-            val_scenarios = list(chunks[fold + 1])
+            # Validation set starts from Chunk 2
+            val_scenarios = list(chunks[fold + 2])
             val_df = self.df_train[self.df_train["scenario_id"].isin(val_scenarios)]
 
             # Sample for speed
@@ -255,8 +264,8 @@ class CVPipelineAnalyzer:
                     n_estimators=100, max_depth=3, learning_rate=0.1,
                     random_state=42, verbose=-1, n_jobs=4
                 )
-                clf.fit(X[tr_idx], y_adv[tr_idx])
-                preds = clf.predict_proba(X[te_idx])[:, 1]
+                utils.SAFE_FIT(clf, X[tr_idx].astype(np.float32), y_adv[tr_idx].astype(np.float32))
+                preds = utils.SAFE_PREDICT_PROBA(clf, X[te_idx].astype(np.float32))[:, 1]
                 aucs.append(roc_auc_score(y_adv[te_idx], preds))
 
             avg_auc = float(np.mean(aucs))
@@ -517,10 +526,10 @@ class TestProxyValidator:
             n_estimators=200, max_depth=3, learning_rate=0.05,
             random_state=42, verbose=-1, n_jobs=4
         )
-        clf.fit(X, y_adv)
-
+        utils.SAFE_FIT(clf, X.astype(np.float32), y_adv.astype(np.float32))
+        
         # Score each training scenario
-        train_test_probs = clf.predict_proba(X_train_sc)[:, 1]
+        train_test_probs = utils.SAFE_PREDICT_PROBA(clf, X_train_sc.astype(np.float32))[:, 1]
         train_scenario_ids = list(train_scenario_agg.index)
 
         scenario_scores = pd.DataFrame({
@@ -590,12 +599,12 @@ class TestProxyValidator:
         temp_df["id_num"] = temp_df["ID"].str.extract(r"(\d+)").astype(int)
         scenario_time = temp_df.groupby("scenario_id")["id_num"].min().sort_values()
         unique_scenarios_main = scenario_time.index.tolist()
-        chunks = np.array_split(unique_scenarios_main, self.n_folds + 1)
+        chunks = np.array_split(unique_scenarios_main, self.n_folds + 2)
 
         cv_splits = []
-        train_scenarios = list(chunks[0])
+        train_scenarios = list(chunks[0]) + list(chunks[1])
         for fold in range(self.n_folds):
-            val_scenarios = list(chunks[fold + 1])
+            val_scenarios = list(chunks[fold + 2])
             tr_idx = main_df[main_df["scenario_id"].isin(train_scenarios)].index.values
             val_idx = main_df[main_df["scenario_id"].isin(val_scenarios)].index.values
 

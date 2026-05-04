@@ -196,12 +196,22 @@ class ForensicLogger:
             if col not in train_df.columns or col not in test_df.columns:
                 continue
             
+            # [SAFETY_CHECK] Ensure numeric type
+            if not pd.api.types.is_numeric_dtype(train_df[col]) or not pd.api.types.is_numeric_dtype(test_df[col]):
+                continue
+            
             # Simple stats
-            tr_mean, tr_std = train_df[col].mean(), train_df[col].std()
-            te_mean, te_std = test_df[col].mean(), test_df[col].std()
+            tr_vals = train_df[col].dropna()
+            te_vals = test_df[col].dropna()
+            
+            if len(tr_vals) == 0 or len(te_vals) == 0:
+                 continue
+                 
+            tr_mean, tr_std = tr_vals.mean(), tr_vals.std()
+            te_mean, te_std = te_vals.mean(), te_vals.std()
             
             # KS test
-            ks_stat, _ = ks_2samp(train_df[col].dropna(), test_df[col].dropna())
+            ks_stat, _ = ks_2samp(tr_vals, te_vals)
             
             drift_results.append({
                 "feature": col,
@@ -339,7 +349,7 @@ class ForensicLogger:
         
         if train_df is not None and len(features) > 1:
             # ONLY use numerical features for correlation/SVD
-            num_features = train_df[features].select_dtypes(include=[np.number]).columns.tolist()
+            num_features = [f for f in features if f in train_df.columns and pd.api.types.is_numeric_dtype(train_df[f])]
             if not num_features:
                  self.add_metric("FEATURE_HEALTH", "metrics", health_info)
                  return

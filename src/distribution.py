@@ -5,6 +5,8 @@ import os
 from scipy.stats import ks_2samp
 from lightgbm import LGBMClassifier
 
+from .config import Config
+from . import utils
 logger = logging.getLogger(__name__)
 
 class DomainShiftAudit:
@@ -50,17 +52,18 @@ class DomainShiftAudit:
             return {}
         
         # Sample for speed (Zero-Hardcode Rule: adaptive sampling)
-        n_tr = min(5000, len(train_df))
-        n_te = min(5000, len(test_df))
+        # [FORENSIC #31] Increased sample size from 5000 to 20000 for better representation
+        n_tr = min(20000, len(train_df))
+        n_te = min(20000, len(test_df))
         
         X_tr = train_df[columns].sample(n_tr, random_state=42).fillna(-999).values
         X_te = test_df[columns].sample(n_te, random_state=42).fillna(-999).values
         
-        X = np.vstack([X_tr, X_te])
-        y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))])
+        X = np.vstack([X_tr, X_te]).astype(np.float32)
+        y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))]).astype(np.float32)
         
         adv_clf = LGBMClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, random_state=42, verbose=-1)
-        adv_clf.fit(X, y)
+        utils.SAFE_FIT(adv_clf, X, y)
         
         return dict(zip(columns, adv_clf.feature_importances_))
 

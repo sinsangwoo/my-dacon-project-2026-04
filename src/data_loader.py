@@ -13,6 +13,7 @@ from scipy.spatial.distance import squareform
 
 from .config import Config
 from .schema import FEATURE_SCHEMA, BASE_COLS
+from . import utils
 from .utils import downcast_df, inspect_columns, track_lineage, ensure_dataframe, GlobalStatStore, assert_artifact_exists
 import itertools
 from lightgbm import LGBMRegressor
@@ -818,29 +819,22 @@ def build_base_features(df, pruning_manifest: "PruningManifest" = None):
                 y_sample = df.loc[sample_indices, Config.TARGET].values
 
             if y_sample is not None and len(y_sample) > 0 and not np.isnan(y_sample).all():
-                # [SSOT_FIX] Local import removed
+                # [MISSION_CONTROL] Optimized selection model to prevent hangs
+                # Use a dedicated lightweight model for importance ranking
                 X_imp = sample_filled.values
-                # [TASK 3 — SHALLOW MODEL CONTRADICTION FIX]
-                # [WHY_THIS_CHANGE] Aligned selection model capacity with the main model.
-                # [ROOT_CAUSE] The temporary model used for cluster representative selection
-                #   was hardcoded to max_depth=3, n_estimators=50. The main model uses
-                #   num_leaves=31 (effectively depth ~5). Features that require deeper 
-                #   splits (like multi-way interactions or conditional flags) received 
-                #   0 importance in the shallow model and were systematically dropped,
-                #   causing a bias against complex features before train time.
-                # [WHY_NOT_ALTERNATIVES] Hardcoding max_depth=5 would create a new magic number.
-                #   The only structurally safe approach is to exactly mirror the main
-                #   model's capacity (RAW_LGBM_PARAMS) so selection matches final usage.
-                # [EXPECTED_IMPACT] Interaction and conditional features that rely on deeper
-                #   splits will now accurately receive importance scores and survive pruning.
-                imp_params = Config.RAW_LGBM_PARAMS.copy()
-                if 'random_state' not in imp_params:
-                    imp_params['random_state'] = 42
-                imp_model = LGBMRegressor(**imp_params)
-                imp_model.fit(X_imp, y_sample)
+                imp_model = LGBMRegressor(
+                    n_estimators=50, 
+                    num_leaves=31, 
+                    max_depth=5, 
+                    n_jobs=1,        # [DEADLOCK_PREVENTION] Avoid OpenMP conflicts in utility tasks
+                    random_state=42, 
+                    verbose=-1
+                )
+                logger.info("[CLUSTER_PRUNE] Calculating feature importance for representative selection...")
+                utils.SAFE_FIT(imp_model, X_imp.astype(np.float32), y_sample.astype(np.float32))
                 importances = dict(zip(feature_names, imp_model.feature_importances_))
                 del imp_model
-                selection_method = "lgbm_importance"
+                selection_method = "lgbm_importance_optimized"
             else:
                 # Fallback: use variance as proxy for importance
                 importances = dict(zip(feature_names, sample_filled.var().values))
@@ -1466,6 +1460,16 @@ def add_extreme_detection_features(df, extreme_quantiles=None, bucket_edges=None
         new_features['congestion_surge'] = df['congestion_score_diff_1'] * df['order_inflow_15m']
     if 'low_battery_ratio' in df.columns and 'robot_active' in df.columns:
         new_features['battery_starvation'] = df['low_battery_ratio'] * df['robot_active']
+        
+    # [TARGETING RECONSTRUCTION] Capacity-Aware Features
+    if 'order_inflow_15m' in df.columns and 'robot_active' in df.columns:
+        new_features['inflow_per_active'] = df['order_inflow_15m'] / (df['robot_active'] + 1e-6)
+    if 'congestion_score' in df.columns and 'robot_active' in df.columns:
+        new_features['congestion_per_active'] = df['congestion_score'] / (df['robot_active'] + 1e-6)
+    if 'max_zone_density' in df.columns and 'robot_idle' in df.columns:
+        new_features['density_per_idle'] = df['max_zone_density'] / (df['robot_idle'] + 1e-6)
+    if 'battery_std' in df.columns and 'robot_idle' in df.columns:
+        new_features['battery_stress_idle'] = df['battery_std'] / (df['robot_idle'] + 1e-6)
 
     # Early Warning
     # [WHY_THIS_DESIGN] Justified Heuristic for Early Warning
@@ -1492,7 +1496,11 @@ def add_extreme_detection_features(df, extreme_quantiles=None, bucket_edges=None
 
     if extreme_quantiles is not None:
         # TEST MODE: use train-derived quantiles
-        threshold = extreme_quantiles.get('order_inflow_15m', df['order_inflow_15m'].quantile(0.95))
+        if 'order_inflow_15m' in extreme_quantiles:
+            threshold = extreme_quantiles['order_inflow_15m']
+        else:
+            threshold = df['order_inflow_15m'].quantile(0.95)
+            extreme_quantiles['order_inflow_15m'] = threshold
     else:
         # TRAIN MODE: compute from train (safe — df IS train)
         threshold = df['order_inflow_15m'].quantile(0.95)
@@ -1503,7 +1511,11 @@ def add_extreme_detection_features(df, extreme_quantiles=None, bucket_edges=None
     for c in key_extreme_cols:
         if c in df.columns:
             if extreme_quantiles is not None:
-                q95 = extreme_quantiles.get(c, df[c].quantile(0.95))
+                if c in extreme_quantiles:
+                    q95 = extreme_quantiles[c]
+                else:
+                    q95 = df[c].quantile(0.95)
+                    extreme_quantiles[c] = q95 # Capture for persistence
             else:
                 q95 = df[c].quantile(0.95)
             extreme_masks.append(df[c] >= q95)

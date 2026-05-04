@@ -67,7 +67,7 @@ class Config:
     N_FOLDS = 5 # Default
     NFOLDS = 5   # Trainer uses NFOLDS
     SMOKE_ROWS = 500
-    TRACE_ROWS = 1000
+    TRACE_ROWS = 20000
     MODE = "full"
     FORCE_OVERWRITE = False
     TRACE_LEVEL = "INFO"
@@ -123,17 +123,19 @@ class Config:
     # Stage 1: Binary Classifier (Q90 Tail Detector)
     # Stage 2: Separate Regressors for Tail vs Non-Tail
     USE_2STAGE_MODEL = True
-    BLENDING_POWER = 2.0  # Sharpening: p^2 to give more weight to tail model
+    BLENDING_POWER = 1.5  # [RELAXED] p^1.5 to reduce base suppression of tail signal
     BIAS_SCALAR = 1.32    # Global scale recovery (derived from Mean Ratio 0.68)
     
     TAIL_CLASSIFIER_PARAMS = {
         'objective': 'binary',
         'metric': 'auc',
         'boosting_type': 'gbdt',
-        'learning_rate': 0.1,
-        'num_leaves': 63,
+        'learning_rate': 0.05,
+        'num_leaves': 31,
+        'n_estimators': 100,
+        'scale_pos_weight': 2.0,
+        'min_data_in_leaf': 20,
         'seed': SEED,
-        'n_estimators': 200,
         'verbose': -1,
         'n_jobs': -1,
     }
@@ -142,8 +144,8 @@ class Config:
         'metric': 'mae',
         'boosting_type': 'gbdt',
         'learning_rate': 0.05,
-        'num_leaves': 31,          # [REDUCED] 127 was causing extreme overfitting
-        'min_child_samples': 50,   # [ADDED] Force statistical power per leaf
+        'num_leaves': 63,          # [REINFORCED] 31 -> 63 for fitting extreme variance
+        'min_child_samples': 10,   # [REINFORCED] 50 -> 10 to allow learning from sparse tail
         'seed': SEED,
         'n_estimators': 200,       # [REDUCED] Prevent noise memorization
         'verbose': -1,
@@ -161,6 +163,37 @@ class Config:
         'verbose': -1,
         'n_jobs': -1,
     }
+    
+    # --- [CONTROLLED AGGRESSION ARCHITECTURE] ---
+    USE_SIGMOID_BLENDING = True
+    SIGMOID_K = 8.0
+    SIGMOID_THETA = 0.55
+    
+    GAP_THRESHOLD = 3.0
+    CLF_TRUST_FLOOR = 0.70
+    SAFE_DAMP_FACTOR = 0.5    # How much to damp weight when unsafe (multiplier)
+    
+    # [ARCHITECTURAL RECONSTRUCTION] Feature specific lists
+    TAIL_DESTRUCTIVE_FEATURES = [
+        'blocked_path_15m', 
+        'diff_robot_utilization_heavy_item_ratio',
+        'warehouse_temp_avg_rel_to_mean_5',
+        'manual_override_ratio_rel_to_mean_5'
+    ]
+    # [TARGETING RECONSTRUCTION] Features that have high Tail AUC but zero TP-FP separation.
+    CLASSIFIER_POISON_FEATURES = [
+        'unique_sku_15m',
+        'fault_count_15m_rolling_mean_5',
+        'fault_count_15m_rolling_std_5',
+        'avg_recovery_time_rolling_mean_5',
+        'avg_recovery_time_rolling_std_5',
+        'fault_count_15m',
+        'avg_recovery_time'
+    ]
+    TAIL_POWER_RATIO = 2.0
+    
+    VARIANCE_RECOVERY_ENABLED = True
+    STD_SCALAR_CAP = 1.5
     
 
 

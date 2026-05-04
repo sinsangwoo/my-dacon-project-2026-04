@@ -81,7 +81,8 @@ EXTREME_SUFFIXES = [
 ]
 
 # 3. Latent / Embedding Features (Supercharged PCA)
-EMBED_DIM = 32
+# [FORENSIC #32] Reduced EMBED_DIM from 32 to 10 to match PCA components and avoid schema mismatch.
+EMBED_DIM = 10
 MULTI_K = [10, 20, 40]
 # [WHY_THIS_DESIGN] volatility_proxy removed as it was identical to embed_std.
 LATENT_PATTERNS = ['embed_mean', 'embed_std', 'weighted_mean', 'trend_proxy']
@@ -116,6 +117,11 @@ def get_feature_schema():
     # [MISSION 3] Physical Features
     raw_features.extend(["surge_velocity", "load_utilization_ratio", "charging_stress", "robot_density", "sku_density", 
                         "congestion_surge", "battery_starvation"])
+    # [TARGETING RECONSTRUCTION] Capacity-Aware Features
+    raw_features.extend([
+        "inflow_per_active", "congestion_per_active", 
+        "density_per_idle", "battery_stress_idle"
+    ])
     
     # [MISSION: SCENARIO CONTEXT - CAUSAL]
     raw_features.extend(["scenario_max_historic", "scenario_volatility_causal"])

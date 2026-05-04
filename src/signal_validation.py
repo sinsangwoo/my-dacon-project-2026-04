@@ -8,9 +8,11 @@ import os
 import gc
 from sklearn.model_selection import KFold, StratifiedKFold, train_test_split
 from scipy.stats import pearsonr
-from .utils import downcast_df
+from .config import Config
 from lightgbm import LGBMClassifier
 from sklearn.metrics import roc_auc_score
+from . import utils
+from .utils import downcast_df
 
 logger = logging.getLogger(__name__)
 
@@ -68,8 +70,9 @@ class SignalValidator:
         # 1. Train evaluator model
         X_tr, X_val, y_tr, y_val = train_test_split(X_with_noise, y_train, test_size=0.2, random_state=42)
         gc.collect()
+        
         model = LGBMRegressor(**self.params)
-        model.fit(X_tr, y_tr)
+        utils.SAFE_FIT(model, X_tr.values.astype(np.float32), y_tr.values.astype(np.float32))
         
         # [NEW] 3-Fold CV for Cross-fold Consistency & Sign Stability
         cv_stats = {f: {'gains': [], 'signs': []} for f in candidates}
@@ -84,7 +87,7 @@ class SignalValidator:
             cv_tr_y, cv_val_y = y_train_arr[tr_idx], y_train_arr[val_idx]
             
             cv_model = LGBMRegressor(**self.params)
-            cv_model.fit(cv_tr_x, cv_tr_y)
+            utils.SAFE_FIT(cv_model, cv_tr_x.values.astype(np.float32), cv_tr_y.astype(np.float32))
             cv_imp = dict(zip(X_with_noise.columns, cv_model.feature_importances_))
             
             for f in candidates:
@@ -132,7 +135,7 @@ class SignalValidator:
         logger.info(f"[SIGNAL_VALIDATOR] Learned Gain Floor: {min_gain_threshold:.4f} (Max Noise Gain: {max_noise_gain:.4f})")
         
         # 3. Permutation Analysis
-        base_pred = model.predict(X_val)
+        base_pred = utils.SAFE_PREDICT(model, X_val.values.astype(np.float32))
         # [OOF_GAP_FIX] NaN-safe metric evaluation
         mask_base = ~np.isnan(base_pred)
         if mask_base.any():
@@ -153,7 +156,7 @@ class SignalValidator:
         X_val_sample = X_val.iloc[sample_indices]
         y_val_sample = y_val[sample_indices]
         
-        base_pred_sample = model.predict(X_val_sample)
+        base_pred_sample = utils.SAFE_PREDICT(model, X_val_sample.values.astype(np.float32))
         # [OOF_GAP_FIX] NaN-safe sample MAE
         mask_sample = ~np.isnan(base_pred_sample)
         if mask_sample.any():
@@ -169,7 +172,7 @@ class SignalValidator:
             # [MEMORY_OPTIMIZATION] In-place permutation to avoid N_FEAT copies of X_val
             orig_vals = X_val_sample[feat].copy()
             X_val_sample[feat] = np.random.permutation(orig_vals.values)
-            p_pred = model.predict(X_val_sample)
+            p_pred = utils.SAFE_PREDICT(model, X_val_sample.values.astype(np.float32))
             mask_p = ~np.isnan(p_pred)
             if mask_p.any():
                 delta = mean_absolute_error(y_val_sample[mask_p], p_pred[mask_p]) - base_mae_sample
@@ -185,7 +188,7 @@ class SignalValidator:
                     saved_group = {m: X_val[m].copy() for m in [feat] + cluster_members}
                     for m in [feat] + cluster_members:
                          X_val[m] = np.random.permutation(X_val[m].values)
-                    g_pred = model.predict(X_val)
+                    g_pred = utils.SAFE_PREDICT(model, X_val.values.astype(np.float32))
                     mask_g = ~np.isnan(g_pred)
                     if mask_g.any():
                         group_delta = mean_absolute_error(y_val[mask_g], g_pred[mask_g]) - base_mae
@@ -403,21 +406,65 @@ class CollectiveDriftPruner:
         self.prune_step = prune_step
         self.pruning_history = []
 
-    def prune(self, train_df, test_df, initial_features, protected_cols=None):
+    def prune(self, train_df, test_df, initial_features, protected_cols=None, base_seed=42, y_train=None):
         # [SSOT_FIX] Local imports removed
         
-        current_features = list(initial_features)
+        # [ROBUSTNESS_FIX] Filter by intersection of columns to prevent KeyErrors
+        available_cols = set(train_df.columns) & set(test_df.columns)
+        missing_initial = set(initial_features) - available_cols
+        if missing_initial:
+            logger.warning(f"[COLLECTIVE_DRIFT] {len(missing_initial)} initial features missing from DataFrames. Pruning them immediately.")
+            
+        current_features = [f for f in initial_features if f in available_cols]
         protected_cols = set(protected_cols or [])
         
-        logger.info(f"[COLLECTIVE_DRIFT] Starting iterative pruning. Target AUC: {self.target_auc}")
+        # [CONTROLLED AGGRESSION] Tail Protection Logic
+        tail_protected = set()
+        if y_train is not None:
+            # 1. Overall Importance (Regression)
+            reg_full = LGBMRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42, verbose=-1)
+            utils.SAFE_FIT(reg_full, train_df[current_features].fillna(-999).values.astype(np.float32), np.log1p(y_train).astype(np.float32))
+            imp_full = reg_full.feature_importances_
+            
+            # 2. Tail Importance (Top 10%)
+            tail_threshold = np.percentile(y_train, 90)
+            tail_mask = y_train >= tail_threshold
+            if tail_mask.any():
+                reg_tail = LGBMRegressor(n_estimators=100, learning_rate=0.1, max_depth=5, random_state=42, verbose=-1)
+                utils.SAFE_FIT(reg_tail, train_df[current_features].loc[tail_mask].fillna(-999).values.astype(np.float32), np.log1p(y_train[tail_mask]).astype(np.float32))
+                imp_tail = reg_tail.feature_importances_
+                
+                # 3. Identify features to protect
+                for idx, feat in enumerate(current_features):
+                    ratio = (imp_tail[idx] + 1e-6) / (imp_full[idx] + 1e-6)
+                    if ratio > Config.TAIL_POWER_RATIO:
+                        tail_protected.add(feat)
+                
+                logger.info(f"[COLLECTIVE_DRIFT] Tail protection activated for {len(tail_protected)} features.")
+        
+        protected_cols = protected_cols | tail_protected
+        
+        # [ROBUSTNESS] Avoid crash on empty or trivial datasets (e.g. smoke test)
+        if not current_features:
+            logger.warning("[COLLECTIVE_DRIFT] No features to prune. Skipping.")
+            return initial_features, []
+            
+        if len(train_df) < 1000:
+            logger.warning(f"[COLLECTIVE_DRIFT] Dataset too small ({len(train_df)}) for reliable audit. Skipping.")
+            return initial_features, []
+            
+        logger.info(f"[COLLECTIVE_DRIFT] Starting iterative pruning on {len(current_features)} features. Target AUC: {self.target_auc}")
         
         for i in range(self.max_iterations):
             # Prepare data
-            n_tr = min(5000, len(train_df))
-            n_te = min(5000, len(test_df))
+            # [FORENSIC #31] Increased sample size for better statistical representation
+            n_tr = min(20000, len(train_df))
+            n_te = min(20000, len(test_df))
             
-            X_tr = train_df[current_features].sample(n_tr, random_state=42 + i).fillna(-999)
-            X_te = test_df[current_features].sample(n_te, random_state=42 + i).fillna(-999)
+            # Use base_seed to ensure different folds get different samples
+            fold_seed = base_seed + i
+            X_tr = train_df[current_features].sample(n_tr, random_state=fold_seed).fillna(-999)
+            X_te = test_df[current_features].sample(n_te, random_state=fold_seed).fillna(-999)
             
             X = pd.concat([X_tr, X_te], axis=0)
             y = np.hstack([np.zeros(len(X_tr)), np.ones(len(X_te))])
@@ -431,11 +478,11 @@ class CollectiveDriftPruner:
                 X_f_tr, X_f_val = X.iloc[tr_idx], X.iloc[val_idx]
                 y_f_tr, y_f_val = y[tr_idx], y[val_idx]
                 
-                clf = LGBMClassifier(n_estimators=100, max_depth=4, learning_rate=0.1, 
-                                     random_state=42, verbose=-1, n_jobs=4)
-                clf.fit(X_f_tr, y_f_tr)
+                clf = LGBMClassifier(n_estimators=50, max_depth=3, learning_rate=0.1, 
+                                     random_state=42, verbose=-1, n_jobs=1)
+                utils.SAFE_FIT(clf, X_f_tr.values.astype(np.float32), y_f_tr.astype(np.float32))
                 
-                preds = clf.predict_proba(X_f_val)[:, 1]
+                preds = utils.SAFE_PREDICT_PROBA(clf, X_f_val.values.astype(np.float32))[:, 1]
                 fold_aucs.append(roc_auc_score(y_f_val, preds))
                 importances += clf.feature_importances_ / 3.0
                 

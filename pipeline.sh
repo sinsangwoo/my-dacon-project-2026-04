@@ -29,7 +29,8 @@ if [ "$PYTHON_MODE" = "debug" ]; then echo "[DEBUG MODE] Activated"; else echo "
 if [ -n "$SMOKE_FLAG" ]; then echo "[SMOKE TEST MODE] Activated"; fi
 
 run_pipeline() {
-    export RUN_ID="run_$(date +%Y%m%d_%H%M%S)"
+    # [SSOT_FIX] Only generate RUN_ID if it's not already provided via env
+    export RUN_ID="${RUN_ID:-run_$(date +%Y%m%d_%H%M%S)}"
     LOG_DIR="logs/$RUN_ID"
     PIPELINE_LOG="$LOG_DIR/pipeline.log"
     mkdir -p "$LOG_DIR"
